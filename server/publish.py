@@ -51,19 +51,32 @@ async def api(method,path,payload=None,params=None,token=None,allow_missing=Fals
     except httpx.HTTPError: raise PublishError('Cannot reach Cloudflare. Check the host network and try again.')
 
 async def zones(token):
-    if not isinstance(token,str) or not re.fullmatch(r'[A-Za-z0-9_-]{20,500}',token): raise PublishError('Enter a valid Cloudflare API token.')
+    # Copy/paste almost always adds a trailing space or newline; tripping the
+    # format check on that made perfectly valid keys look broken.
+    token = token.strip() if isinstance(token, str) else token
+    if not isinstance(token,str) or not re.fullmatch(r'[A-Za-z0-9_-]{20,500}',token):
+        raise PublishError('Enter a valid Cloudflare API token (40+ characters, letters/digits/-/_).')
     result=[]
     # Zone API is paginated; cap protects against unexpectedly large accounts.
-    for page in range(1,11):
-        rows=await api('GET','/zones',params={'page':page,'per_page':50,'status':'active'},token=token)
-        if not isinstance(rows,list): raise PublishError('Unexpected response from Cloudflare zones API.')
-        result.extend({'id':z['id'],'name':z['name'],'account_id':z['account']['id']} for z in rows if z.get('id') and z.get('name') and z.get('account',{}).get('id'))
-        if len(rows)<50: break
+    try:
+        for page in range(1,11):
+            rows=await api('GET','/zones',params={'page':page,'per_page':50,'status':'active'},token=token)
+            if not isinstance(rows,list): raise PublishError('Unexpected response from Cloudflare zones API.')
+            result.extend({'id':z['id'],'name':z['name'],'account_id':z['account']['id']} for z in rows if z.get('id') and z.get('name') and z.get('account',{}).get('id'))
+            if len(rows)<50: break
+    except PublishError as exc:
+        msg=str(exc)
+        if 'failed' in msg and ('Authentication' in msg or 'Invalid request headers' in msg):
+            raise PublishError('Cloudflare rejected this token. Verify it is an API Token (not the Global API Key) and is active.')
+        if 'failed' in msg and 'Authentication error' in msg:
+            raise PublishError('Cloudflare rejected this token as invalid or expired.')
+        raise
     return result
 
 async def connect(token,zone_id):
     async with lock:
         if load(): raise PublishError('Remove all published ports before replacing the Cloudflare connection.')
+        token = token.strip() if isinstance(token,str) else token
         options=await zones(token)
         zone=next((z for z in options if z['id']==zone_id),None)
         if not zone: raise PublishError('Zone not found or token lacks Zone Read permission.')
