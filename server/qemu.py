@@ -115,6 +115,7 @@ class QemuVM:
         self.ip: Optional[str] = None
         self.gateway: Optional[str] = None
         self.boot_ms: Optional[int] = None
+        self.started_at: Optional[float] = None   # wall-clock boot time, for uptime
         self.accel: str = "tcg"
         self.ssh_port: Optional[int] = None
 
@@ -190,6 +191,7 @@ class QemuVM:
         # SLIRP hands out a fixed layout; no DHCP snooping required.
         self.ip, self.gateway = "10.0.2.15", "10.0.2.2"
         self.boot_ms = int((time.monotonic() - t0) * 1000)
+        self.started_at = time.time()
 
     async def _make_overlay(self, qemu_img: str) -> None:
         """Copy-on-write clone of the golden image -- instant, near-zero bytes."""
@@ -370,6 +372,7 @@ class QemuVM:
         self._tasks = []
         self._ser_w = self._qmp_w = None
         self._serial_srv = self._qmp_srv = None
+        self.started_at = None
 
     async def suspend(self) -> None:
         """Shut the guest down cleanly but keep its disk, so it can come back."""

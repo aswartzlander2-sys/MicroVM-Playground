@@ -43,6 +43,7 @@ class VMView(BaseModel):
     gateway: Optional[str] = None
     created_at: float
     boot_ms: Optional[int] = None
+    started_at: Optional[float] = None     # wall-clock boot time; uptime = now - started_at
     expires_at: Optional[float] = None
     error: Optional[str] = None
     terminal_url: Optional[str] = None    # ttyd path, when ttyd is serving

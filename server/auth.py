@@ -7,8 +7,20 @@ from starlette.responses import JSONResponse
 from . import credentials
 
 _sessions = {}  # opaque random tokens, intentionally invalidated at restart
+_bridges = {}   # ttyd bridge tokens: token -> (expiry, vm_id)
 _attempts = defaultdict(deque)
 TTL = 12 * 60 * 60
+BRIDGE_TTL = 24 * 60 * 60
+
+
+def issue_bridge(vm_id: str) -> str:
+    """One short-lived token letting this server's own ttyd bridge dial the
+    console websocket of exactly one machine. The bridge connects from
+    localhost without a browser session, so it authenticates with a token
+    instead of a cookie -- and only for that one path."""
+    token = secrets.token_urlsafe(24)
+    _bridges[token] = (time.time() + BRIDGE_TTL, vm_id)
+    return token
 
 class AuthMiddleware:
     def __init__(self, app): self.app = app
@@ -28,8 +40,19 @@ class AuthMiddleware:
         now = time.time()
         for key, session_info in list(_sessions.items()):
             if session_info[0] < now: _sessions.pop(key, None)
+        for key, bridge_info in list(_bridges.items()):
+            if bridge_info[0] < now: _bridges.pop(key, None)
         session = _sessions.get(token)
         signed = bool(configured and session and session[0] > now and hmac.compare_digest(session[1], stamp))
+        # The per-machine ttyd bridge authenticates with a token scoped to that
+        # machine's console path instead of a browser session.
+        bridge_ok = False
+        if scope['type'] == 'websocket' and path.startswith('/api/vms/') and path.endswith('/console'):
+            from urllib.parse import parse_qs
+            vm_id = path.split('/')[3]
+            got = (parse_qs(scope.get('query_string', b'').decode('latin1')).get('bridge') or [None])[0]
+            info = _bridges.get(got) if got else None
+            bridge_ok = bool(info and info[0] > now and info[1] == vm_id)
         async def reply(response): return await response(scope, receive, send)
         # Prevent cross-site browser requests, including websocket hijacking.
         origin = headers.get('origin')
@@ -80,7 +103,7 @@ class AuthMiddleware:
         if path == '/api/auth/logout' and method == 'POST':
             _sessions.pop(token, None); response = JSONResponse({'ok':True}); response.delete_cookie('robo_session'); return await reply(response)
         protected = path.startswith('/api/') or path.startswith('/terminal/')
-        if protected and not signed:
+        if protected and not signed and not bridge_ok:
             if scope['type'] == 'websocket': return await send({'type':'websocket.close','code':1008})
             return await reply(JSONResponse({'detail':'Sign in required'}, status_code=401))
         return await self.app(scope, receive, send)

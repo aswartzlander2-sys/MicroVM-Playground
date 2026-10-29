@@ -106,11 +106,9 @@ def _print_banner() -> None:
 
 app = FastAPI(title="Robo Universal", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
-# ttyd uses an unauthenticated internal bridge; the protected built-in terminal is
-# used instead. Only force-off the default, so an explicit MVMP_TTYD_ENABLE=on
-# still works (see config.py) rather than being silently clobbered at import.
-if C.USE_TTYD == "auto":
-    C.USE_TTYD = "off"
+# ttyd's internal bridge is authenticated with a per-machine token issued at
+# session start (auth.issue_bridge), so ttyd can stay enabled like upstream
+# whenever its binary is installed; explicit MVMP_TTYD_ENABLE=off still wins.
 
 
 @app.get("/api/cloudflare/setup")

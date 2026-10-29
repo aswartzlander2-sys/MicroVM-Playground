@@ -103,9 +103,12 @@ class TtydSession:
         self.port = _free_port()
 
         # replay=0: ttyd hands every connection a clean screen, so replaying the
-        # boot log would land it on top of whatever the shell is showing.
-        console = ("ws://127.0.0.1:%d/api/vms/%s/console?replay=0"
-                   % (self.server_port, self.vm_id))
+        # boot log would land it on top of whatever the shell is showing. The
+        # bridge token is what authenticates this server's own dial against the
+        # auth gate, scoped to exactly this machine's console.
+        from .auth import issue_bridge
+        console = ("ws://127.0.0.1:%d/api/vms/%s/console?replay=0&bridge=%s"
+                   % (self.server_port, self.vm_id, issue_bridge(self.vm_id)))
         argv = [
             exe,
             "--port", str(self.port),

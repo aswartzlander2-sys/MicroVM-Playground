@@ -101,6 +101,7 @@ class Record:
             vcpus=self.spec.vcpus, mem_mib=self.spec.mem_mib, disk_gb=self.spec.disk_gb,
             ip=getattr(self.vm, "ip", None), gateway=getattr(self.vm, "gateway", None),
             created_at=self.created_at, boot_ms=getattr(self.vm, "boot_ms", None),
+            started_at=getattr(self.vm, "started_at", None),
             expires_at=self.expires_at, error=self.error,
             terminal_url=self.terminal_url,
             image=self.spec.image, image_label=self.image_label,
