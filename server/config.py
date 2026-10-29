@@ -33,6 +33,10 @@ def _default_state_dir() -> str:
 
 STATE_DIR = _p("MVMP_STATE_DIR", _default_state_dir())
 IMAGES_DIR = STATE_DIR / "images"
+# Where the downloaded cloud base images (debian-base.qcow2, ...) live. Kept
+# separate so a server can point per-VM bake work at one shared download cache
+# while each VM's golden image stays in its own directory.
+BASE_CACHE_DIR = _p("MVMP_BASE_CACHE", str(IMAGES_DIR))
 VMS_DIR = STATE_DIR / "vms"
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"

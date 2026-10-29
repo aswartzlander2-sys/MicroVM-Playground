@@ -195,16 +195,15 @@ def build_seed(path: Path, packages: str, hostname: str = "playground", distro: 
 
 
 def fetch_base(dest: Path, url: str) -> None:
-    if dest.exists():
-        log("base image already downloaded (%.0f MB)" % (dest.stat().st_size / 2**20))
-        return
-    log("downloading the Debian cloud image (~350 MB)")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".part")
-    with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
-        shutil.copyfileobj(r, f, 1 << 20)
-    tmp.replace(dest)
-    log("downloaded %.0f MB" % (dest.stat().st_size / 2**20))
+    if not dest.exists():
+        log("downloading the Debian cloud image (~350 MB)")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Per-process temp name: two concurrent first-time bakes must not race.
+        tmp = dest.parent / ("%s.%d.part" % (dest.name, os.getpid()))
+        with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+        tmp.replace(dest)
+    log("base image ready at %s (%.0f MB)" % (dest, dest.stat().st_size / 2**20))
 
 
 def main() -> int:
@@ -238,8 +237,12 @@ def main() -> int:
         print("QEMU not found. Run tools/get-qemu.ps1 first.", file=sys.stderr)
         return 1
 
+    # The downloaded base lives in a shared cache (MVMP_BASE_CACHE): one copy
+    # serves every VM; only the golden images are per-VM. golden/seed stay in
+    # IMAGES_DIR, which the manager pins to each VM's own directory.
+    C.BASE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     C.IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    base = C.IMAGES_DIR / spec["base"]
+    base = C.BASE_CACHE_DIR / spec["base"]
     # Non-default distros are written beside the golden image under their own
     # name. The catalogue lists every qcow2 it finds, so a baked arch.qcow2
     # simply appears in the OS dropdown with no further wiring.

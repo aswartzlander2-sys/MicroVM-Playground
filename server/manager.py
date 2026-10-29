@@ -326,6 +326,9 @@ class Manager:
         marker.touch(mode=0o600, exist_ok=True)
         env = os.environ.copy()
         env["MVMP_STATE_DIR"] = str(vm_dir / "provision")
+        # One shared 350 MB base download for every VM ever created on this
+        # server; each VM still gets its own golden image and seed.
+        env["MVMP_BASE_CACHE"] = str(C.STATE_DIR / "images")
         env.pop("MVMP_IMAGE", None)
         # Each VM gets its own base, seed and logs. No shared downloaded image.
         args = [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "bake.py"),
