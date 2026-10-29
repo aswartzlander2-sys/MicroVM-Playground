@@ -2,13 +2,16 @@
 """Bake the golden guest image.
 
 Boots the stock Debian cloud image once with a cloud-init seed that installs a
-real userland, sets up autologin on the serial console, and then disables
-cloud-init so every later boot goes straight to a shell. The result is the
-image every playground is cloned from.
+real userland and sets up autologin on the serial console. The result is the
+image every playground is cloned from. cloud-init stays ENABLED in the golden:
+each machine attaches its own tiny seed (new instance-id, its own hostname),
+so every clone personalises itself on first boot while later boots of the same
+machine stay cached no-ops.
 
     python tools/bake.py                     # fetch + bake, defaults
     python tools/bake.py --packages "git curl jq"
     python tools/bake.py --disk-gb 12 --force
+    python tools/bake.py --seed-only --seed-path /tmp/seed.iso --hostname foo
 
 This is the slow step: under TCG software emulation, apt inside an emulated
 CPU takes a while. It happens once.
@@ -116,11 +119,8 @@ __MOTD__
   - [ systemctl, daemon-reload ]
   - [ systemctl, enable, "serial-getty@ttyS0.service" ]
   - [ sed, -i, 's/^#*PrintMotd.*/PrintMotd yes/', /etc/ssh/sshd_config ]
-  - export DEBIAN_FRONTEND=noninteractive; apt-get update -q
-  - export DEBIAN_FRONTEND=noninteractive; apt-get install -y -q --no-install-recommends __PACKAGES__
-  - [ apt-get, clean ]
+__PKGLINES__
   - [ systemctl, mask, "systemd-networkd-wait-online.service" ]
-  - [ touch, /etc/cloud/cloud-init.disabled ]
   - [ sh, -c, "echo BAKE-COMPLETE > /dev/ttyS0" ]
 
 power_state:
@@ -129,7 +129,10 @@ power_state:
   condition: true
 """
 
-META_DATA = "instance-id: mvmp-bake\nlocal-hostname: __HOSTNAME__\n"
+# Fresh instance-id per machine: it is what makes cloud-init treat a clone's
+# first boot as real firstboot (hostname, credentials) without re-running on
+# any later boot of the same machine.
+META_DATA = "instance-id: __INSTANCE_ID__\nlocal-hostname: __HOSTNAME__\n"
 
 # /etc/motd is displayed with `cat`, which does not interpret escapes -- so the
 # escapes have to be real bytes in the file. printf writes them; a cloud-init
@@ -161,7 +164,22 @@ def log(msg, colour="36"):
     print("\033[1;%sm==>\033[0m %s" % (colour, msg), flush=True)
 
 
-def build_seed(path: Path, packages: str, hostname: str = "playground", distro: str = "debian") -> None:
+def _package_runcmd(distro: str, packages: str) -> list[str]:
+    """The package-install runcmd lines; empty for a seed that installs nothing."""
+    if not packages:
+        return []
+    if distro == "arch":
+        return ["  - pacman -Sy --noconfirm",
+                "  - pacman -S --noconfirm --needed " + packages,
+                "  - [ pacman, -Sc, --noconfirm ]"]
+    return ["  - export DEBIAN_FRONTEND=noninteractive; apt-get update -q",
+            "  - export DEBIAN_FRONTEND=noninteractive; apt-get install -y -q "
+            "--no-install-recommends " + packages,
+            "  - [ apt-get, clean ]"]
+
+
+def build_seed(path: Path, packages: str, hostname: str = "playground",
+               distro: str = "debian", instance_id: str = "mvmp-bake") -> None:
     """A tiny ISO9660 volume labelled CIDATA -- cloud-init's NoCloud source."""
     import pycdlib
 
@@ -173,15 +191,16 @@ def build_seed(path: Path, packages: str, hostname: str = "playground", distro: 
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f: f.write(password + "\n")
     print("Initial guest password saved in " + str(password_file) + " (mode 600)")
-    user = (USER_DATA.replace("__HOSTNAME__", hostname).replace("__GUEST_PASSWORD__", password).replace("__PACKAGES__", packages)
-                     .replace("__MOTD__", _motd_commands()).encode("utf-8"))
-    if distro == "arch":
-        user = (user.decode("utf-8")
-            .replace("  - export DEBIAN_FRONTEND=noninteractive; apt-get update -q\n", "  - pacman -Sy --noconfirm\n")
-            .replace("  - export DEBIAN_FRONTEND=noninteractive; apt-get install -y -q --no-install-recommends ", "  - pacman -S --noconfirm --needed ")
-            .replace("  - [ apt-get, clean ]", "  - [ pacman, -Sc, --noconfirm ]")
+    user = (USER_DATA
+            .replace("__HOSTNAME__", hostname)
+            .replace("__GUEST_PASSWORD__", password)
+            .replace("__MOTD__", _motd_commands())
+            .replace("__PKGLINES__", "\n".join(_package_runcmd(distro, packages)))
             .encode("utf-8"))
-    meta = META_DATA.replace("__HOSTNAME__", hostname).encode("utf-8")
+    meta = (META_DATA
+            .replace("__HOSTNAME__", hostname)
+            .replace("__INSTANCE_ID__", instance_id)
+            .encode("utf-8"))
 
     iso = pycdlib.PyCdlib()
     iso.new(interchange_level=3, joliet=3, rock_ridge="1.09", vol_ident="CIDATA")
@@ -216,6 +235,12 @@ def main() -> int:
                     help="debian is the default image; arch is offered alongside it")
     ap.add_argument("--packages", default=None)
     ap.add_argument("--url", default=None)
+    ap.add_argument("--seed-only", action="store_true",
+                    help="write a per-VM seed ISO and exit -- no bake, no QEMU")
+    ap.add_argument("--seed-path", default=None,
+                    help="with --seed-only: where to write the seed ISO")
+    ap.add_argument("--instance-id", default="mvmp-bake",
+                    help="cloud-init instance-id; per-VM seeds use the VM id")
     ap.add_argument("--out", default=None,
                     help="output filename inside the images directory")
     ap.add_argument("--timeout", type=int, default=5400)
@@ -228,6 +253,16 @@ def main() -> int:
     spec = DISTROS[args.distro]
     if args.packages is None:
         args.packages = spec["packages"]
+
+    if args.seed_only:
+        # Per-VM seed: no packages (the golden already has the toolset), the
+        # machine's own hostname and a fresh instance-id.
+        path = Path(args.seed_path) if args.seed_path else C.IMAGES_DIR / "seed-custom.iso"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        build_seed(path, "", args.hostname, args.distro, instance_id=args.instance_id)
+        log("seed written to %s" % path, "32")
+        return 0
+
     if args.url is None:
         args.url = spec["url"]
 

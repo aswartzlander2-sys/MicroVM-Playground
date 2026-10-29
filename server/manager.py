@@ -263,6 +263,18 @@ class Manager:
                 return s
         raise RuntimeError("no free slots (MVMP_MAX_VMS=%d)" % C.MAX_VMS)
 
+    def _make_seed(self, vm_id: str, name: str, distro: str = "debian") -> Optional[str]:
+        """This machine's own cloud-init seed: name is the real guest hostname.
+
+        A fresh instance-id makes cloud-init run exactly once on the clone's
+        first boot (set hostname, credentials) and never again afterwards.
+        """
+        from tools.bake import build_seed
+        seed = C.VMS_DIR / vm_id / "seed.iso"
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        build_seed(seed, "", name, distro, instance_id=vm_id)
+        return str(seed)
+
     def _make_vm(self, vm_id: str, slot: int, spec: CreateVM, name: str):
         disk = max(spec.disk_gb, self.min_disk_gb())
         img = catalog.resolve(self.backend, spec.image)
@@ -274,7 +286,11 @@ class Manager:
             return ContainerVM(vm_id, slot, spec.vcpus, spec.mem_mib, disk, name, img)
         if self.backend == "qemu":
             from .qemu import QemuVM
-            return QemuVM(vm_id, slot, spec.vcpus, spec.mem_mib, disk, name, img)
+            seed = None
+            if C.BASE_IMAGE.exists():
+                seed = self._make_seed(vm_id, name,
+                                       "arch" if "arch" in (spec.image or "") else "debian")
+            return QemuVM(vm_id, slot, spec.vcpus, spec.mem_mib, disk, name, img, seed=seed)
         from .firecracker import FirecrackerVM
         return FirecrackerVM(vm_id, slot, spec.vcpus, spec.mem_mib, disk, name, img)
 
@@ -360,8 +376,9 @@ class Manager:
                 raise RuntimeError("Image preparation produced no golden image at %s (see prepare.log)" % C.BASE_IMAGE)
             C._image_gb_cache = None   # the golden just appeared; re-probe its virtual size
             disk = max(rec.spec.disk_gb, self.min_disk_gb())
+            seed = self._make_seed(rec.id, rec.name, "debian")
             rec.vm = QemuVM(rec.id, rec.slot, rec.spec.vcpus, rec.spec.mem_mib,
-                            disk, rec.name, str(C.BASE_IMAGE))
+                            disk, rec.name, str(C.BASE_IMAGE), seed=seed)
             await rec.vm.start()
             rec.state = "running"
             self._save_record(rec)
@@ -444,9 +461,11 @@ class Manager:
         rec = self._vms.get(vm_id)
         if rec is None:
             return None
+        if self.backend == "qemu" and name != rec.name:
+            raise RuntimeError("Renaming a guest is not supported; its name is its hostname")
         rec.name = name
-        # Guests are copy-on-write clones of the shared golden image, so the UI
-        # name is only a label; no hostname tie-in to protect.
+        # qemu keeps the name as the guest's cloud-init-set hostname (fixed at
+        # boot); other backends treat it purely as a label.
         with contextlib.suppress(Exception):
             if rec.vm is not None:
                 rec.vm.name = name

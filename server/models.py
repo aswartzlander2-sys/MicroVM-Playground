@@ -77,7 +77,8 @@ class RenameVM(BaseModel):
     @field_validator("name")
     @classmethod
     def _clean(cls, v: str) -> str:
-        v = "".join(ch for ch in v.strip() if ch.isalnum() or ch in "-_").lower()
-        if not v:
-            raise ValueError("a name needs at least one letter, digit, - or _")
-        return v[:32]
+        import re
+        v = v.strip().lower()
+        if v and not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", v):
+            raise ValueError("Use a hostname of 1–32 lowercase letters, digits and hyphens, with no hyphen at either end")
+        return v

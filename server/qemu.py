@@ -93,7 +93,8 @@ class QemuVM:
     """Owns the lifecycle of exactly one QEMU guest."""
 
     def __init__(self, vm_id: str, slot: int, vcpus: int, mem_mib: int, disk_gb: int,
-                 name: str = "", image: Optional[str] = None):
+                 name: str = "", image: Optional[str] = None,
+                 seed: Optional[str] = None):
         self.id = vm_id
         self.name = name or vm_id[:8]
         self.slot = slot
@@ -104,6 +105,10 @@ class QemuVM:
         self.dir = C.VMS_DIR / vm_id
         self.overlay = self.dir / "disk.qcow2"
         self.base_image = Path(image) if image else C.BASE_IMAGE
+        # This machine's own cloud-init seed (its hostname + fresh instance-id),
+        # attached read-only on every fresh start. Suspends resume without it:
+        # the guest has already consumed it and caches the result on disk.
+        self.seed_path = Path(seed) if seed else None
 
         self.proc: Optional[subprocess.Popen] = None
         self.console = ConsoleHub()
@@ -227,7 +232,7 @@ class QemuVM:
             "-qmp", "tcp:127.0.0.1:%d,server=off" % qmp_port,
             "-rtc", "base=utc",
         ]
-        seed = self.base_image.parent / "seed.iso"
+        seed = self.seed_path or (self.base_image.parent / "seed.iso")
         if seed.exists():
             argv += ["-drive", "file=%s,if=virtio,format=raw,readonly=on" % seed]
         return argv
