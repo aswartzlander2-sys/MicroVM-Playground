@@ -166,6 +166,19 @@ async def guest_files(vm_id: str, request: Request):
     if manager.backend != "qemu" or not getattr(rec.vm, "ssh_port", None):
         raise HTTPException(status_code=400, detail="File browser currently requires a QEMU VM with SSH enabled")
     data = await request.json()
+    if not data.get('password'):
+        # Default credentials: this machine seeds its own guest password at
+        # creation time; the server already knows it. Anything typed by the
+        # user still takes precedence.
+        with contextlib.suppress(OSError):
+            data['password'] = (C.VMS_DIR / vm_id / 'seed-initial-password').read_text().strip()
+        if not data.get('password'):
+            # Legacy machines (created before per-VM seeds) kept the golden's
+            # baked-in password.
+            with contextlib.suppress(OSError):
+                for cand in sorted(C.IMAGES_DIR.glob('seed-*-initial-password')):
+                    data['password'] = cand.read_text().strip()
+                    break
     try:
         result = await asyncio.to_thread(files.handle, rec.vm.ssh_port, data)
     except files.FileError as exc:

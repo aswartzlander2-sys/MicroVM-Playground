@@ -12,12 +12,16 @@ def handle(port, data):
         raise FileError('Bad request body')
     action = data.get('action')
     path = data.get('path', '/')
-    user = data.get('username', '')
-    password = data.get('password', '')
+    # The guest is our own machine and root is its only account; an empty
+    # username means root, not "please re-prompt the user".
+    user = data.get('username') or 'root'
+    password = data.get('password') or ''
+    if not isinstance(user, str) or len(user) > 128 or not isinstance(password, str) or len(password) > 1024:
+        raise FileError('Bad SSH credentials')
+    if not password:
+        raise FileError('No guest password on record -- enter it manually')
     if not isinstance(path, str) or not path.startswith('/') or '\x00' in path or len(path) > 4096:
         raise FileError('Use an absolute guest path')
-    if not isinstance(user, str) or not user or len(user) > 128 or not isinstance(password, str) or len(password) > 1024:
-        raise FileError('Enter your guest SSH username and password')
     if action not in ('list','read','write','download'):
         raise FileError('Unsupported operation')
     client = paramiko.SSHClient()
