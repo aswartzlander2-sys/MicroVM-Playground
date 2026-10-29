@@ -580,10 +580,12 @@ html[data-theme='light'] .toast { box-shadow: 0 16px 40px -16px rgba(60, 45, 25,
 .cbtn:focus-visible { outline: none; box-shadow: var(--focus); }
 .cbtn.danger-hover:hover { background: var(--err-soft); color: var(--err); border-color: var(--err); }
 #consolemodal #terminal { height: min(52vh, 430px); }
-#consolemodal #ttydframe {
+#consolemodal #ttydframe:not([hidden]) {
   height: min(52vh, 430px); width: 100%; flex: none; display: block;
   border: 1px solid var(--line); border-radius: var(--r); background: #000;
 }
+/* The hidden attribute must always win, regardless of any display rule above. */
+[hidden] { display: none !important; }
 .cbtn svg { width: 14px; height: 14px; display: block; margin: auto; }
 .cbtn.danger:hover { background: var(--err-soft); color: var(--err); border-color: var(--err); }
 /* fullscreen = the console box itself, like image-3: header on top, terminal
