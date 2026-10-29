@@ -136,7 +136,9 @@ class QemuVM:
         if not self.base_image.exists():
             raise QemuError("image missing at %s -- run setup.ps1" % self.base_image)
 
-        self.accel = detect_accelerator(qemu)
+        # detect_accelerator spawns subprocesses (up to ~8 s per candidate);
+        # never run that work on the event loop.
+        self.accel = await asyncio.to_thread(detect_accelerator, qemu)
         self.dir.mkdir(parents=True, exist_ok=True)
 
         await self._make_overlay(qemu_img)
@@ -150,12 +152,12 @@ class QemuVM:
         creation.
         """
         # Allocate a loopback-only SSH forward for optional SFTP management.
-        # The port is reserved only until QEMU binds it; a collision fails the VM
-        # startup rather than exposing an SSH service externally.
-        import socket
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            self.ssh_port = sock.getsockname()[1]
+        # Deterministic per slot: an ephemeral bind-then-close port can be
+        # stolen by other listeners in the seconds before QEMU binds its
+        # hostfwd, which makes startup fail opaquely. Unique slots make
+        # collisions between running VMs impossible.
+        if self.ssh_port is None:
+            self.ssh_port = 21200 + self.slot
         t0 = time.monotonic()
         self._connected = asyncio.Event()
         self._qmp_ready = asyncio.Event()
@@ -275,6 +277,8 @@ class QemuVM:
     async def host_forward(self, host_port: int, guest_port: int, remove: bool = False) -> None:
         # Host loopback is essential: Burrow is the public, authenticated edge.
         import uuid
+        if self._qmp_w is None:
+            raise QemuError("QEMU is not running (QMP channel disconnected)")
         await asyncio.wait_for(self._qmp_ready.wait(), 10)
         key = uuid.uuid4().hex
         fut = asyncio.get_running_loop().create_future()
@@ -373,7 +377,7 @@ class QemuVM:
             raise QemuError("QEMU not found")
         if not self.overlay.exists():
             raise QemuError("this playground's disk is gone; it cannot be resumed")
-        self.accel = detect_accelerator(qemu)
+        self.accel = await asyncio.to_thread(detect_accelerator, qemu)
         self.console = ConsoleHub()      # the old hub was closed on suspend
         await self._launch(qemu)
 

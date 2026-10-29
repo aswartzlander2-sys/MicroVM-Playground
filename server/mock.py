@@ -422,8 +422,8 @@ class MockVM:
     def _cmd_df(self, args):
         total = self.disk_gb * 1024 * 1024
         used = int(total * 0.18)
-        self._emit("Filesystem      1K-blocks      Used Available Use%% Mounted on".replace("%%", "%"))
-        self._emit("/dev/vda        %9d %9d %9d  18%% /".replace("%%", "%")
+        self._emit("Filesystem      1K-blocks      Used Available Use% Mounted on")
+        self._emit("/dev/vda        %9d %9d %9d  18%% /"
                    % (total, used, total - used))
 
     def _cmd_history(self, args):
@@ -464,7 +464,12 @@ class MockVM:
         parts = line.split()
         fn = getattr(self, "_cmd_" + parts[0].replace("-", "_"), None)
         if fn:
-            fn(parts[1:])
+            # Mirror _exec: a failing nested command must not escape and kill
+            # the console websocket it was typed into.
+            try:
+                fn(parts[1:])
+            except Exception as exc:
+                self._emit(_c("91", "error: " + str(exc)))
 
     def _cmd_neofetch(self, args):
         self._cmd_fetch(args)

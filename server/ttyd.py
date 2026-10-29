@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -136,6 +137,8 @@ class TtydSession:
             if self.proc.poll() is None:
                 with contextlib.suppress(Exception):
                     os.killpg(os.getpgid(self.proc.pid), 9)
+                with contextlib.suppress(Exception):
+                    self.proc.wait(timeout=5)
 
     @property
     def alive(self) -> bool:
@@ -157,6 +160,11 @@ def start_for(vm_id: str, server_port: int) -> Optional[TtydSession]:
     try:
         s.start()
     except Exception:
+        return None
+    # The ephemeral port is bound-then-closed; ttyd can lose that race and exit
+    # immediately. Check for liveness before advertising the session.
+    time.sleep(0.3)
+    if s.proc is None or s.proc.poll() is not None:
         return None
     _sessions[vm_id] = s
     return s

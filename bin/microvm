@@ -24,7 +24,7 @@ microvm — Robo Universal command line
   microvm url            Print the local dashboard address
   microvm help           Show this help
 
-The default address is http://127.0.0.1:45952. Live publishing requires Aegis.
+The default address is http://127.0.0.1:45952. Publishing uses Cloudflare tunnels (cloudflared + API token).
 EOF
 }
 pid_of_server() {
@@ -78,7 +78,7 @@ case "${1:-help}" in
     printf 'QEMU: '; command -v qemu-system-x86_64 || echo missing
     printf 'qemu-img: '; command -v qemu-img || echo missing
     printf 'systemd user service: '; if systemctl --user show-environment >/dev/null 2>&1; then echo available; else echo unavailable; fi
-    printf 'Aegis socket: '; [ -S "${ROBO_BURROW_SOCKET:-$HOME/.local/share/aegis/data/control.sock}" ] && echo available || echo unavailable
+    printf 'cloudflared (publishing): '; command -v cloudflared >/dev/null 2>&1 && echo found || echo missing
     echo 'Images are downloaded on VM creation.' ;;
   url) echo 'http://127.0.0.1:45952' ;;
   *) echo "Unknown command: $1" >&2; usage >&2; exit 2 ;;

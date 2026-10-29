@@ -137,7 +137,8 @@ if [ -t 0 ] && command -v systemctl >/dev/null && systemctl --user show-environm
       fi
       mkdir -p "$(dirname "$service")"
       # systemd unit paths are quoted rather than interpreted by a shell.
-      escaped_here=${HERE//\/\\}; escaped_here=${escaped_here//\"/\\\"}
+      # Escape backslashes first, then double quotes, so nothing is inert.
+      escaped_here=${HERE//\\/\\\\}; escaped_here=${escaped_here//\"/\\\"}
       cat > "$service" <<EOF
 [Unit]
 Description=Robo Universal dashboard
@@ -163,7 +164,22 @@ EOF
   fi
 fi
 # Launch as a service when available: no terminal is needed afterwards.
+state="${XDG_STATE_HOME:-$HOME/.local/state}/robo-universal"
+pidfile="$state/server.pid"
 if [ "$backend" = qemu ] && [ -f "$HOME/.config/systemd/user/robo-universal.service" ] && systemctl --user show-environment >/dev/null 2>&1; then
+  # A leftover fallback server would hold port 45952 and put the service into a
+  # restart crash-loop; stop it and clear its pidfile before starting systemd.
+  if [ -f "$pidfile" ]; then
+    oldpid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ "$oldpid" =~ ^[0-9]+$ ]] && kill -0 "$oldpid" 2>/dev/null \
+       && tr '\0' ' ' < "/proc/$oldpid/cmdline" 2>/dev/null | grep -Fq "$HERE/run_server.py"; then
+      echo '  Stopping an older background server before starting the service.'
+      kill "$oldpid" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do kill -0 "$oldpid" 2>/dev/null || break; sleep 1; done
+      kill -9 "$oldpid" 2>/dev/null || true
+      rm -f "$pidfile"
+    fi
+  fi
   if ! systemctl --user is-active --quiet robo-universal.service; then
     systemctl --user start robo-universal.service
   fi
@@ -173,9 +189,12 @@ if [ "$backend" = qemu ] && [ -f "$HOME/.config/systemd/user/robo-universal.serv
 fi
 # Fallback for hosts without a user service: detach from the terminal. This
 # stays running when the terminal closes, but does not provide boot startup.
-state="${XDG_STATE_HOME:-$HOME/.local/state}/robo-universal"
 mkdir -p "$state"
-pidfile="$state/server.pid"
+if [ -f "$HOME/.config/systemd/user/robo-universal.service" ] && systemctl --user is-active --quiet robo-universal.service 2>/dev/null; then
+  echo '  Already served by the systemd service on port 45952. Run "microvm stop"' >&2
+  echo '  first, or pass --port to use a different address.' >&2
+  exit 1
+fi
 if [ -f "$pidfile" ]; then
   oldpid=$(cat "$pidfile" 2>/dev/null || true)
   if [[ "$oldpid" =~ ^[0-9]+$ ]] && kill -0 "$oldpid" 2>/dev/null && [ -r "/proc/$oldpid/cmdline" ] && tr '\0' ' ' < "/proc/$oldpid/cmdline" | grep -Fq "$HERE/run_server.py"; then

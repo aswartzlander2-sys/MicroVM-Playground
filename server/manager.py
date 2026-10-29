@@ -314,6 +314,7 @@ class Manager:
             with contextlib.suppress(Exception):
                 if rec.vm is not None:
                     await rec.vm.stop(graceful=False)
+            self._slots.discard(rec.slot)
         return rec
 
     async def _prepare_qemu(self, rec: Record) -> None:
@@ -330,6 +331,13 @@ class Manager:
         args = [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "bake.py"),
                 "--distro", "debian", "--hostname", rec.name, "--disk-gb", str(max(8, rec.spec.disk_gb)), "--mem-mib", str(max(1024, rec.spec.mem_mib)), "--vcpus", str(rec.spec.vcpus), "--out", "golden.qcow2"]
         proc = None
+        # _progress() reads this file to report real status on the machine card.
+        progress_file = vm_dir / "progress.json"
+        def _write_progress() -> None:
+            tmp = vm_dir / "progress.json.tmp"
+            tmp.write_text(json.dumps({"phase": "download", "message": "Downloading and preparing the Debian image; package installation can take several minutes.", "percent": None}))
+            os.replace(tmp, progress_file)
+        await asyncio.to_thread(_write_progress)
         try:
             with (vm_dir / "prepare.log").open("wb") as log:
                 proc = await asyncio.create_subprocess_exec(*args, env=env, stdout=log,
@@ -345,6 +353,7 @@ class Manager:
             rec.state = "running"
             self._save_record(rec)
             marker.unlink(missing_ok=True)
+            progress_file.unlink(missing_ok=True)
         except asyncio.CancelledError:
             if proc and proc.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
@@ -367,6 +376,9 @@ class Manager:
                 with contextlib.suppress(Exception): await rec.vm.stop(graceful=False)
             # Failed preparations leave no downloaded disk images behind.
             await asyncio.to_thread(shutil.rmtree, vm_dir / "provision", True)
+            (vm_dir / "progress.json").unlink(missing_ok=True)
+            # Release the slot/subnet: nothing holds it while the bake failed.
+            self._slots.discard(rec.slot)
         finally:
             rec.task = None
 
@@ -535,6 +547,8 @@ class Manager:
     async def shutdown(self) -> None:
         if self._reaper:
             self._reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reaper
         from . import ttyd
         with contextlib.suppress(Exception):
             ttyd.stop_all()

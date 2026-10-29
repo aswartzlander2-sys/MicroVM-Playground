@@ -42,7 +42,10 @@ class AuthMiddleware:
         if path == '/api/auth/login' and method == 'POST':
             if not configured: return await reply(JSONResponse({'detail':'Run ./run.sh to configure your login.'}, status_code=503))
             ip = (scope.get('client') or ('unknown',0))[0]
-            attempts = _attempts[ip]
+            # Not a defaultdict access: succeeded logins must not leave a permanent
+            # per-IP entry behind (unbounded memory growth guard).
+            attempts = _attempts.get(ip)
+            if attempts is None: attempts = _attempts[ip] = deque()
             while attempts and attempts[0] < now - 600: attempts.popleft()
             if len(attempts) >= 8: return await reply(JSONResponse({'detail':'Too many attempts. Try again in 10 minutes.'}, status_code=429))
             body = b''
@@ -57,11 +60,20 @@ class AuthMiddleware:
             except Exception: supplied = ''; username = ''
             # Scrypt is deliberately expensive; keep it off the event loop.
             import asyncio
-            valid = await asyncio.to_thread(credentials.verify, cfg, username, supplied) if cfg else (hmac.compare_digest(username, os.environ.get('ROBO_USERNAME', 'admin')) and hmac.compare_digest(supplied, password))
+            if cfg is None:
+                # hmac.compare_digest only supports ASCII str; encode so any
+                # valid UTF-8 login compares (and never raises) in constant time.
+                valid = (hmac.compare_digest(username.encode('utf-8'), os.environ.get('ROBO_USERNAME', 'admin').encode('utf-8'))
+                         and hmac.compare_digest(supplied.encode('utf-8'), password.encode('utf-8')))
+            else:
+                valid = await asyncio.to_thread(credentials.verify, cfg, username, supplied)
             if not valid:
                 attempts.append(now)
                 return await reply(JSONResponse({'detail':'Incorrect username or password.'}, status_code=401))
-            attempts.clear(); token = secrets.token_urlsafe(32); _sessions[token] = (now + TTL, stamp)
+            attempts.clear()
+            # Successful login: keep failed-attempt memory only for IPs that need it.
+            if not attempts: _attempts.pop(ip, None)
+            token = secrets.token_urlsafe(32); _sessions[token] = (now + TTL, stamp)
             response = JSONResponse({'ok':True})
             response.set_cookie('robo_session', token, max_age=TTL, httponly=True, samesite='strict', secure=(scope.get('scheme') == 'https'))
             return await reply(response)

@@ -48,7 +48,10 @@ async def lifespan(app: FastAPI):
         reconcile_task.cancel()
         with contextlib.suppress(asyncio.CancelledError): await reconcile_task
         await manager.shutdown()
-        await publish.reconcile(manager)
+        # reconcile() repeats the tunnel/DNS cleanup close_vm already did. Bound
+        # it so unreachable Cloudflare can't stretch shutdown into minutes.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(publish.reconcile(manager), timeout=10)
 
 
 def _print_banner() -> None:
@@ -103,8 +106,11 @@ def _print_banner() -> None:
 
 app = FastAPI(title="Robo Universal", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
-# ttyd uses an unauthenticated internal bridge; the protected built-in terminal is used instead.
-C.USE_TTYD = "off"
+# ttyd uses an unauthenticated internal bridge; the protected built-in terminal is
+# used instead. Only force-off the default, so an explicit MVMP_TTYD_ENABLE=on
+# still works (see config.py) rather than being silently clobbered at import.
+if C.USE_TTYD == "auto":
+    C.USE_TTYD = "off"
 
 
 @app.get("/api/cloudflare/setup")
@@ -291,8 +297,13 @@ async def console(ws: WebSocket, vm_id: str):
                 except ValueError:
                     rec.vm.write(msg["text"].encode("utf-8"))
                     continue
-                if payload.get("type") == "resize":
-                    rec.vm.resize(int(payload.get("rows", 24)), int(payload.get("cols", 80)))
+                # Control frames may be malformed; ignore junk instead of
+                # tearing down the websocket.
+                if isinstance(payload, dict) and payload.get("type") == "resize":
+                    try:
+                        rec.vm.resize(int(payload.get("rows", 24)), int(payload.get("cols", 80)))
+                    except (TypeError, ValueError):
+                        pass
     except WebSocketDisconnect:
         pass
     finally:

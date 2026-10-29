@@ -431,4 +431,4 @@ ok "minimum disk per playground is now ${MINGB} GB (the base image size)"
 echo
 c '1;32' "Setup complete."
 echo "  Start it with:  sudo ./run.sh"
-echo "  Then open:      http://127.0.0.1:8080"
+echo "  Then open:      http://127.0.0.1:45952"

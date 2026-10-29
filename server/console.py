@@ -51,10 +51,16 @@ class ConsoleHub:
     def close(self) -> None:
         self.closed = True
         for q in list(self._subs):
-            try:
-                q.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+            for _ in range(2):
+                try:
+                    q.put_nowait(None)
+                    break
+                except asyncio.QueueFull:
+                    # A full buffer would swallow the sentinel and leave the
+                    # consumer parked on get() forever; evict one stale item
+                    # and retry so wake-up is guaranteed.
+                    try: q.get_nowait()
+                    except asyncio.QueueEmpty: pass
         self._subs.clear()
 
     # --- consumer side -------------------------------------------------------

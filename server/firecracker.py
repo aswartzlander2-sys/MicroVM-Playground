@@ -204,7 +204,7 @@ class FirecrackerVM:
                 with contextlib.suppress(Exception):
                     os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
                 with contextlib.suppress(Exception):
-                    self.proc.wait(timeout=3)
+                    await asyncio.to_thread(self.proc.wait, 3)
         self._detach_reader()
         if self._master_fd is not None:
             with contextlib.suppress(OSError):
@@ -239,7 +239,7 @@ class FirecrackerVM:
                 with contextlib.suppress(Exception):
                     os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
                 with contextlib.suppress(Exception):
-                    self.proc.wait(timeout=3)
+                    await asyncio.to_thread(self.proc.wait, 3)
 
         self._detach_reader()
         if self._master_fd is not None:

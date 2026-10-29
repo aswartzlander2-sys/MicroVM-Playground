@@ -139,6 +139,13 @@ class WarmPool:
                 self._ready.append(cid)
 
     async def drain(self) -> None:
+        # Stop any refill in progress first: a _create() that completes after
+        # the snapshot below would re-add an id we never remove.
+        task, self._task = self._task, None
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         async with self._lock:
             ids, self._ready = self._ready, []
         for cid in ids:
@@ -320,6 +327,9 @@ class ContainerVM:
         if self.proc and self.proc.poll() is None:
             with contextlib.suppress(Exception):
                 self.proc.kill()
+            # Reap so no defunct docker-exec child lingers after the kill.
+            with contextlib.suppress(Exception):
+                self.proc.wait(timeout=5)
         self._detach_reader()
         if self._master_fd is not None:
             with contextlib.suppress(OSError):

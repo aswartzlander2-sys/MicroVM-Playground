@@ -8,6 +8,8 @@ MAX_DOWNLOAD = 16 * 1024 * 1024
 class FileError(Exception): pass
 
 def handle(port, data):
+    if not isinstance(data, dict):
+        raise FileError('Bad request body')
     action = data.get('action')
     path = data.get('path', '/')
     user = data.get('username', '')

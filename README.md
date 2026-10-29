@@ -20,7 +20,7 @@ playground image; then:
 ./run.sh
 ```
 
-Port 8080 forwards automatically.
+Port 45952 forwards automatically.
 
 Which backend you get depends on what the Codespace actually offers, and that
 varies. Some Codespace machine types **do** expose `/dev/kvm` — where they do,
@@ -156,7 +156,7 @@ the `stty` injection a serial console requires.
 .\run.ps1
 ```
 
-Then open <http://127.0.0.1:8080>.
+Then open <http://127.0.0.1:45952>.
 
 `setup.ps1` needs no elevation. It installs the Python dependencies, unpacks a
 **portable QEMU**, and bakes the golden guest image.
@@ -243,7 +243,7 @@ The default package list is deliberately lean for that reason.
 |---|---|---|
 | `MVMP_BACKEND` | `auto` | `container`, `qemu`, `firecracker` or `mock` |
 | `MVMP_STATE_DIR` | `%LOCALAPPDATA%\mvmp` / `/var/lib/mvmp` | images and per-VM data |
-| `MVMP_HOST` / `MVMP_PORT` | `127.0.0.1` / `8080` | bind address |
+| `MVMP_HOST` / `MVMP_PORT` | `127.0.0.1` / `45952` | bind address |
 | `MVMP_ACCEL` | autoprobed | force `tcg`, `whpx`, `kvm`, `hvf` |
 | `MVMP_IMAGE` | `images/golden.qcow2` | golden image for QEMU |
 | `MVMP_MAX_VMS` | `32` | concurrent playground cap |
