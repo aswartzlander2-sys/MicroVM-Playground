@@ -129,6 +129,28 @@ power_state:
   condition: true
 """
 
+# First boot of a clone: set the machine's own hostname and root credentials,
+# nothing else. The golden already carries the full toolset -- no packages, no
+# MOTD rewrite, and deliberately NO power_state: a bake powers off on purpose
+# when done, but a clone must stay up after cloud-init finishes.
+VM_USER_DATA = """#cloud-config
+hostname: __HOSTNAME__
+manage_etc_hosts: true
+disable_root: false
+ssh_pwauth: true
+
+users:
+  - name: root
+    lock_passwd: false
+
+chpasswd:
+  expire: false
+  users:
+    - name: root
+      password: __GUEST_PASSWORD__
+      type: text
+"""
+
 # Fresh instance-id per machine: it is what makes cloud-init treat a clone's
 # first boot as real firstboot (hostname, credentials) without re-running on
 # any later boot of the same machine.
@@ -179,8 +201,13 @@ def _package_runcmd(distro: str, packages: str) -> list[str]:
 
 
 def build_seed(path: Path, packages: str, hostname: str = "playground",
-               distro: str = "debian", instance_id: str = "mvmp-bake") -> None:
-    """A tiny ISO9660 volume labelled CIDATA -- cloud-init's NoCloud source."""
+               distro: str = "debian", instance_id: str = "mvmp-bake",
+               mode: str = "bake") -> None:
+    """A tiny ISO9660 volume labelled CIDATA -- cloud-init's NoCloud source.
+
+    mode="bake"  full template: packages, MOTD, completion marker, power off.
+    mode="clone" minimal template: hostname + credentials only, stays up.
+    """
     import pycdlib
 
     # Each newly baked template gets a unique password, stored owner-only.
@@ -191,7 +218,8 @@ def build_seed(path: Path, packages: str, hostname: str = "playground",
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f: f.write(password + "\n")
     print("Initial guest password saved in " + str(password_file) + " (mode 600)")
-    user = (USER_DATA
+    template = VM_USER_DATA if mode == "clone" else USER_DATA
+    user = (template
             .replace("__HOSTNAME__", hostname)
             .replace("__GUEST_PASSWORD__", password)
             .replace("__MOTD__", _motd_commands())
@@ -241,6 +269,8 @@ def main() -> int:
                     help="with --seed-only: where to write the seed ISO")
     ap.add_argument("--instance-id", default="mvmp-bake",
                     help="cloud-init instance-id; per-VM seeds use the VM id")
+    ap.add_argument("--mode", choices=("bake", "clone"), default="clone",
+                    help="clone seeds are minimal (stay up); bake seeds power off when done")
     ap.add_argument("--out", default=None,
                     help="output filename inside the images directory")
     ap.add_argument("--timeout", type=int, default=5400)
@@ -259,7 +289,7 @@ def main() -> int:
         # machine's own hostname and a fresh instance-id.
         path = Path(args.seed_path) if args.seed_path else C.IMAGES_DIR / "seed-custom.iso"
         path.parent.mkdir(parents=True, exist_ok=True)
-        build_seed(path, "", args.hostname, args.distro, instance_id=args.instance_id)
+        build_seed(path, "", args.hostname, args.distro, instance_id=args.instance_id, mode=args.mode)
         log("seed written to %s" % path, "32")
         return 0
 

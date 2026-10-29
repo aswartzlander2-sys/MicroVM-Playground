@@ -534,6 +534,7 @@ html[data-theme='light'] .toast { box-shadow: 0 16px 40px -16px rgba(60, 45, 25,
 .mrow { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--muted); }
 .mrow b { color: var(--text-2); font-weight: 500; font-variant-numeric: tabular-nums; text-align: right; }
 .mrow b.mono { font-family: var(--mono); font-size: 11.5px; }
+.mchip.mono { font-family: var(--mono); font-size: 11px; color: var(--text-2); }
 .vm-actions.main-actions { margin-top: 12px; display: flex; gap: 8px; }
 .vm-actions.main-actions .ghost { flex: 1; }
 .vm-actions.sub-actions { display: flex; gap: 8px; margin-top: 6px; }
@@ -583,6 +584,18 @@ html[data-theme='light'] .toast { box-shadow: 0 16px 40px -16px rgba(60, 45, 25,
   height: min(52vh, 430px); width: 100%; flex: none; display: block;
   border: 1px solid var(--line); border-radius: var(--r); background: #000;
 }
-#consolemodal:has(#ttydframe:not([hidden])) #ttydframe { height: min(62vh, 520px); }
-#consolemodal:fullscreen .console-dialog { border-radius: 0; max-height: none; height: 100vh; }
-#consolemodal:fullscreen #terminal, #consolemodal:fullscreen #ttydframe { height: calc(100vh - 130px); }
+.cbtn svg { width: 14px; height: 14px; display: block; margin: auto; }
+.cbtn.danger:hover { background: var(--err-soft); color: var(--err); border-color: var(--err); }
+/* fullscreen = the console box itself, like image-3: header on top, terminal
+   fills everything in between, status line at the bottom. Native API first,
+   .is-max fallback when the browser refuses. */
+.console-dialog:fullscreen, .console-dialog.is-max {
+  width: 100vw; height: 100vh; max-height: none; border-radius: 0;
+  padding: 12px 14px; background: var(--bg); box-shadow: none; border: 0;
+}
+#consolemodal .console-dialog:fullscreen #terminal,
+#consolemodal .console-dialog.is-max #terminal,
+#consolemodal .console-dialog:fullscreen #ttydframe,
+#consolemodal .console-dialog.is-max #ttydframe {
+  flex: 1 1 auto; height: auto; max-height: none; min-height: 0;
+}

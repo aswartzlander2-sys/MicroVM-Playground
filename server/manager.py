@@ -273,7 +273,7 @@ class Manager:
         from tools.bake import build_seed
         seed = C.VMS_DIR / vm_id / "seed.iso"
         seed.parent.mkdir(parents=True, exist_ok=True)
-        build_seed(seed, "", name, distro, instance_id=vm_id)
+        build_seed(seed, "", name, distro, instance_id=vm_id, mode="clone")
         return str(seed)
 
     def _make_vm(self, vm_id: str, slot: int, spec: CreateVM, name: str):
