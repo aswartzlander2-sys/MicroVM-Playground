@@ -149,8 +149,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory="$escaped_here"
 Environment=MVMP_BACKEND=qemu
-Environment=MVMP_PORT=45952
-ExecStart="$escaped_here/.venv/bin/python" "$escaped_here/run_server.py" --host 127.0.0.1 --port 45952
+Environment=MVMP_PORT=64732
+ExecStart="$escaped_here/.venv/bin/python" "$escaped_here/run_server.py" --host 127.0.0.1 --port 64732
 Restart=on-failure
 RestartSec=5
 
@@ -167,7 +167,7 @@ fi
 state="${XDG_STATE_HOME:-$HOME/.local/state}/robo-universal"
 pidfile="$state/server.pid"
 if [ "$backend" = qemu ] && [ -f "$HOME/.config/systemd/user/robo-universal.service" ] && systemctl --user show-environment >/dev/null 2>&1; then
-  # A leftover fallback server would hold port 45952 and put the service into a
+  # A leftover fallback server would hold port 64732 and put the service into a
   # restart crash-loop; stop it and clear its pidfile before starting systemd.
   if [ -f "$pidfile" ]; then
     oldpid=$(cat "$pidfile" 2>/dev/null || true)
@@ -183,7 +183,7 @@ if [ "$backend" = qemu ] && [ -f "$HOME/.config/systemd/user/robo-universal.serv
   if ! systemctl --user is-active --quiet robo-universal.service; then
     systemctl --user start robo-universal.service
   fi
-  echo '  Running in the background at http://127.0.0.1:45952'
+  echo '  Running in the background at http://127.0.0.1:64732'
   echo '  Logs: journalctl --user -u robo-universal -f'
   exit 0
 fi
@@ -191,7 +191,7 @@ fi
 # stays running when the terminal closes, but does not provide boot startup.
 mkdir -p "$state"
 if [ -f "$HOME/.config/systemd/user/robo-universal.service" ] && systemctl --user is-active --quiet robo-universal.service 2>/dev/null; then
-  echo '  Already served by the systemd service on port 45952. Run "microvm stop"' >&2
+  echo '  Already served by the systemd service on port 64732. Run "microvm stop"' >&2
   echo '  first, or pass --port to use a different address.' >&2
   exit 1
 fi
@@ -212,7 +212,7 @@ if ! kill -0 "$pid" 2>/dev/null; then
   rm -f "$pidfile"
   exit 1
 fi
-echo "  Running in the background (PID $pid). Open http://127.0.0.1:45952"
+echo "  Running in the background (PID $pid). Open http://127.0.0.1:64732"
 echo "  Logs: $state/server.log"
 echo '  Boot startup requires the systemd user service.'
 

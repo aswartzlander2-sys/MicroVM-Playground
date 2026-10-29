@@ -1,7 +1,7 @@
 <#
   Start the playground server.
 
-      .\run.ps1                 QEMU guests on 127.0.0.1:45952
+      .\run.ps1                 QEMU guests on 127.0.0.1:64732
       .\run.ps1 -Port 9000
       .\run.ps1 -Mock           simulated VMs, for UI work only
 
@@ -10,7 +10,7 @@
 #>
 [CmdletBinding()]
 param(
-  [int]$Port = 45952,
+  [int]$Port = 64732,
   [string]$BindHost = "127.0.0.1",
   [switch]$Mock
 )

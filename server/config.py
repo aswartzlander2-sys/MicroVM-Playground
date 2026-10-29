@@ -74,14 +74,14 @@ TTYD_MAX_CLIENTS = int(os.environ.get("MVMP_TTYD_CLIENTS", "8"))
 USE_TTYD = os.environ.get("MVMP_TTYD_ENABLE", "auto").lower()   # auto | on | off
 
 # Set at startup so ttyd can point its bridge back at us.
-RUNTIME_PORT = int(os.environ.get("MVMP_PORT", "45952"))
+RUNTIME_PORT = int(os.environ.get("MVMP_PORT", "64732"))
 
 # --- server ------------------------------------------------------------------
 # Codespaces forwards ports from inside the container, so bind all interfaces
 # there. The forwarded port is private to the user unless they publish it.
 IN_CODESPACE = os.environ.get("CODESPACES", "").lower() == "true"
 BIND_HOST = os.environ.get("MVMP_HOST", "0.0.0.0" if IN_CODESPACE else "127.0.0.1")
-BIND_PORT = int(os.environ.get("MVMP_PORT", "45952"))
+BIND_PORT = int(os.environ.get("MVMP_PORT", "64732"))
 
 # --- networking (firecracker only; qemu uses user-mode SLIRP) ----------------
 SUBNET_BASE = os.environ.get("MVMP_SUBNET_BASE", "172.16")

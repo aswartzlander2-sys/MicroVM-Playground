@@ -24,7 +24,7 @@ microvm — Robo Universal command line
   microvm url            Print the local dashboard address
   microvm help           Show this help
 
-The default address is http://127.0.0.1:45952. Publishing uses Cloudflare tunnels (cloudflared + API token).
+The default address is http://127.0.0.1:64732. Publishing uses Cloudflare tunnels (cloudflared + API token).
 EOF
 }
 pid_of_server() {
@@ -58,7 +58,7 @@ case "${1:-help}" in
     if service_active; then echo 'Running as a systemd user service.'
     elif pid=$(pid_of_server); then echo "Running in the background (PID $pid)."
     else echo 'Not running.'; exit 1; fi
-    echo 'Dashboard: http://127.0.0.1:45952' ;;
+    echo 'Dashboard: http://127.0.0.1:64732' ;;
   logs)
     if service_active; then exec journalctl --user -u "$service" -f
     else mkdir -p "$STATE"; touch "$STATE/server.log"; exec tail -f "$STATE/server.log"; fi ;;
@@ -80,6 +80,6 @@ case "${1:-help}" in
     printf 'systemd user service: '; if systemctl --user show-environment >/dev/null 2>&1; then echo available; else echo unavailable; fi
     printf 'cloudflared (publishing): '; command -v cloudflared >/dev/null 2>&1 && echo found || echo missing
     echo 'Images are downloaded on VM creation.' ;;
-  url) echo 'http://127.0.0.1:45952' ;;
+  url) echo 'http://127.0.0.1:64732' ;;
   *) echo "Unknown command: $1" >&2; usage >&2; exit 2 ;;
 esac
