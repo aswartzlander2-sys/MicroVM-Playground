@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import codecs
 import json
+import os
 import re
 import subprocess
 import sys
@@ -35,8 +36,42 @@ def check(name, ok, detail=""):
     return ok
 
 
+# The dashboard is behind a login since the auth gate: sign in once, then every
+# request and websocket carries the session cookie.
+COOKIE = {}
+
+
+def login(url):
+    user = os.environ.get("ROBO_USERNAME", "admin")
+    password = os.environ.get("ROBO_PASSWORD", "")
+    if not password:
+        return
+    req = urllib.request.Request(url + "/api/auth/login", method="POST",
+                                 data=json.dumps({"username": user, "password": password}).encode())
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        for h in r.headers.get_all("Set-Cookie") or []:
+            m = re.match(r"robo_session=([^;]+)", h)
+            if m:
+                COOKIE["robo_session"] = m.group(1)
+
+
+def cookie_header():
+    return "; ".join("%s=%s" % kv for kv in COOKIE.items())
+
+
+def ws_connect(url, **kw):
+    """websockets.connect, carrying the session cookie (header argument by version)."""
+    headers = {"Cookie": cookie_header()} if COOKIE else {}
+    major = int(websockets.__version__.split(".")[0])
+    key = "additional_headers" if major >= 14 else "extra_headers"
+    return websockets.connect(url, **{key: headers}, **kw)
+
+
 def api(url, path, method="GET", body=None):
     req = urllib.request.Request(url + path, method=method)
+    if COOKIE:
+        req.add_header("Cookie", cookie_header())
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -144,6 +179,8 @@ async def main():
     print("\n\033[1mhost\033[0m")
     for _ in range(60):
         try:
+            if not COOKIE:
+                login(args.url)
             host = api(args.url, "/api/host")
             break
         except Exception:
@@ -183,8 +220,8 @@ async def main():
 
     # ------------------------------------------------------------- console
     print("\n\033[1mguest\033[0m")
-    async with websockets.connect(ws_url + "/api/vms/%s/console" % vm["id"],
-                                  max_size=None, open_timeout=30) as ws:
+    async with ws_connect(ws_url + "/api/vms/%s/console" % vm["id"],
+                          max_size=None, open_timeout=30) as ws:
         sh = Shell(ws)
         got = await sh.wait_prompt(args.shell_timeout)
         if not check("reached a shell", got, ANSI.sub("", sh.text)[-300:]):
@@ -244,8 +281,8 @@ async def main():
               % (sh.chunks, sh.replacements))
 
     # reattach: scrollback replay must not inject junk
-    async with websockets.connect(ws_url + "/api/vms/%s/console" % vm["id"],
-                                  max_size=None, open_timeout=30) as ws:
+    async with ws_connect(ws_url + "/api/vms/%s/console" % vm["id"],
+                          max_size=None, open_timeout=30) as ws:
         sh2 = Shell(ws)
         await sh2.pump(6)
         clean = ANSI.sub("", sh2.text)
@@ -259,7 +296,10 @@ async def main():
         check("playground exposes a terminal url",
               bool(path) and path.startswith("/terminal/"), str(path))
         if path:
-            page = urllib.request.urlopen(args.url + path, timeout=30)
+            preq = urllib.request.Request(args.url + path)
+            if COOKIE:
+                preq.add_header("Cookie", cookie_header())
+            page = urllib.request.urlopen(preq, timeout=30)
             body = page.read().decode("utf-8", "replace")
             check("ttyd page proxies", page.status == 200 and "ttyd" in body.lower(),
                   "status=%s len=%d" % (page.status, len(body)))
@@ -269,9 +309,9 @@ async def main():
             # chain -- proxy -> ttyd -> attach.py -> console hub -> guest.
             ws_path = args.url.replace("http://", "ws://").replace("https://", "wss://")
             try:
-                async with websockets.connect(ws_path + path.rstrip("/") + "/ws",
-                                              subprotocols=["tty"], max_size=None,
-                                              open_timeout=30) as tws:
+                async with ws_connect(ws_path + path.rstrip("/") + "/ws",
+                                      subprotocols=["tty"], max_size=None,
+                                      open_timeout=30) as tws:
                     await tws.send(json.dumps({"AuthToken": ""}))
                     await asyncio.sleep(1.5)
                     await tws.send(b"0" + b"echo TTYD-CHAIN-OK\n")

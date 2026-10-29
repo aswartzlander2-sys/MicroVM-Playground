@@ -90,13 +90,15 @@ jobs:
         timeout-minutes: 2
         env:
           MVMP_BACKEND: container
+          ROBO_USERNAME: admin
+          ROBO_PASSWORD: ci-only-password
         run: |
           python run_server.py --host 127.0.0.1 --port 8080 > server.log 2>&1 &
           echo $! > server.pid
+          # /api/host is behind the login gate: the open session endpoint says it's up
           for i in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:8080/api/host >/dev/null; then
+            if curl -sf http://127.0.0.1:8080/api/auth/session >/dev/null; then
               echo "server up after ${i}s"
-              curl -s http://127.0.0.1:8080/api/host | python -m json.tool | head -12
               exit 0
             fi
             sleep 1
@@ -105,6 +107,9 @@ jobs:
 
       - name: Smoke test
         timeout-minutes: 5
+        env:
+          ROBO_USERNAME: admin
+          ROBO_PASSWORD: ci-only-password
         run: python tests/smoke.py --url http://127.0.0.1:8080 --expect-backend container --boot-budget-ms 5000
 
       - name: Server log
