@@ -324,8 +324,12 @@ def main() -> int:
     fetch_base(base, args.url)
 
     log("preparing a %d GB working copy" % args.disk_gb)
-    if golden.exists():
-        golden.unlink()
+    # Baked beside the final name and renamed only once the guest reports
+    # BAKE-COMPLETE: a bake that is cancelled, crashes or is still running never
+    # leaves a half-built golden where every new machine would clone it.
+    final = golden
+    golden = final.with_name(final.name + ".partial")
+    golden.unlink(missing_ok=True)
     shutil.copyfile(base, golden)
     subprocess.run([qemu_img, "resize", "-q", str(golden), "%dG" % args.disk_gb], check=True)
 
@@ -380,6 +384,8 @@ def main() -> int:
         return 1
 
     seed.unlink(missing_ok=True)
+    os.replace(golden, final)
+    golden = final
     log("golden image ready in %.0f s: %s (%.0f MB on disk)"
         % (took, golden, golden.stat().st_size / 2**20), "32")
     return 0

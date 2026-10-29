@@ -104,7 +104,8 @@ def _print_banner() -> None:
         pass
 
 
-app = FastAPI(title="Robo Universal", lifespan=lifespan)
+# The interactive API docs sat outside the login gate (only /api/ and /terminal/ are gated)
+app = FastAPI(title="Robo Universal", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(AuthMiddleware)
 # ttyd's internal bridge is authenticated with a per-machine token issued at
 # session start (auth.issue_bridge), so ttyd can stay enabled like upstream
@@ -164,6 +165,8 @@ async def guest_files(vm_id: str, request: Request):
     if manager.backend != "qemu" or not getattr(rec.vm, "ssh_port", None):
         raise HTTPException(status_code=400, detail="File browser currently requires a QEMU VM with SSH enabled")
     data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Send a JSON object")
     if not data.get('password'):
         # Default credentials: this machine seeds its own guest password at
         # creation time; the server already knows it. Anything typed by the
@@ -208,7 +211,13 @@ async def list_vms():
 async def create_vm(spec: CreateVM):
     # Never silently substitute Debian for an unavailable selection.
     available = await asyncio.to_thread(catalog.list_images, manager.backend)
-    if spec.image not in {item["id"] for item in available}:
+    ids = {item["id"] for item in available}
+    # The golden Debian ("default", or "debian" from the web UI's Debian card) is
+    # always a valid choice on QEMU: a fresh install has none yet, and the first
+    # machine bakes it. Rejecting it made that first machine impossible.
+    if manager.backend == "qemu":
+        ids.update(catalog.GOLDEN_IDS)
+    if spec.image not in ids:
         raise HTTPException(status_code=400, detail="That image is not available on this backend")
     try:
         rec = await manager.create(spec)
@@ -437,6 +446,28 @@ class RevalidatingStaticFiles(StaticFiles):
 app.mount("/", RevalidatingStaticFiles(directory=str(C.WEB_DIR)), name="web")
 
 
+_state_lock = None
+
+
+def _lock_state_dir():
+    """Hold an exclusive lock on STATE_DIR/server.lock for the life of the process."""
+    if os.name == "nt":
+        return None
+    import fcntl
+    C.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(C.STATE_DIR / "server.lock", "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(0)
+        other = f.read().strip() or "another process"
+        raise SystemExit(f"Another Robo Universal server ({other}) already manages {C.STATE_DIR}. "
+                         "Stop it first (microvm stop), or give this one its own MVMP_STATE_DIR.")
+    f.seek(0); f.truncate()
+    f.write(f"pid {os.getpid()}"); f.flush()
+    return f
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="microVM playground server")
     ap.add_argument("--mock", action="store_true",
@@ -448,6 +479,13 @@ def main() -> None:
     # ttyd's bridge dials back into this server, so it needs the port we
     # actually bound -- not the default.
     C.RUNTIME_PORT = args.port
+    C.RUNTIME_HOST = args.host
+
+    # One server per state directory. Two of them (a leftover background
+    # server, a hand-started one, a mock) each think they own the same VMs,
+    # slots and disks, and the next launch or cleanup trips over the other.
+    global _state_lock
+    _state_lock = _lock_state_dir()
 
     if args.mock:
         os.environ["MVMP_MOCK"] = "1"

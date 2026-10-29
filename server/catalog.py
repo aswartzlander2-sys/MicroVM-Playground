@@ -42,6 +42,8 @@ CONTAINER_IMAGES: dict[str, tuple[str, str, str]] = {
 }
 
 DEFAULT_ID = "default"
+# QEMU's golden Debian answers to both (the web UI's Debian card sends "debian")
+GOLDEN_IDS = (DEFAULT_ID, "debian")
 
 
 # `docker image inspect` is a subprocess round-trip each. Seven of them, called
@@ -125,7 +127,11 @@ def list_images(backend: str) -> list[dict]:
             })
         return items
     if backend == "qemu":
-        return _disk_images("*.qcow2", C.BASE_IMAGE.name)
+        items = _disk_images("*.qcow2", C.BASE_IMAGE.name)
+        if not any(i["id"] == DEFAULT_ID for i in items):
+            items.insert(0, {"id": DEFAULT_ID, "label": "debian · built on first use", "ref": str(C.BASE_IMAGE),
+                             "ready": False, "note": "the first machine builds it (a few minutes, once)"})
+        return items
     if backend == "firecracker":
         return _disk_images("*.ext4", C.BASE_ROOTFS.name)
     return [{"id": "default", "label": "simulated", "ref": "-", "ready": True,

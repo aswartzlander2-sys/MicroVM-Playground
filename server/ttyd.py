@@ -107,8 +107,11 @@ class TtydSession:
         # bridge token is what authenticates this server's own dial against the
         # auth gate, scoped to exactly this machine's console.
         from .auth import issue_bridge
-        console = ("ws://127.0.0.1:%d/api/vms/%s/console?replay=0&bridge=%s"
-                   % (self.server_port, self.vm_id, issue_bridge(self.vm_id)))
+        # The server's own address: loopback unless it listens on one address only.
+        host = C.RUNTIME_HOST if C.RUNTIME_HOST not in ("", "0.0.0.0", "::") else "127.0.0.1"
+        host = "[%s]" % host if ":" in host else host
+        console = ("ws://%s:%d/api/vms/%s/console?replay=0&bridge=%s"
+                   % (host, self.server_port, self.vm_id, issue_bridge(self.vm_id)))
         argv = [
             exe,
             "--port", str(self.port),
@@ -177,6 +180,8 @@ def stop_for(vm_id: str) -> None:
     s = _sessions.pop(vm_id, None)
     if s:
         s.stop()
+    from .auth import revoke_bridges
+    revoke_bridges(vm_id)
 
 
 def stop_all() -> None:

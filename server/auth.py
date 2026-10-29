@@ -14,13 +14,33 @@ BRIDGE_TTL = 24 * 60 * 60
 
 
 def issue_bridge(vm_id: str) -> str:
-    """One short-lived token letting this server's own ttyd bridge dial the
-    console websocket of exactly one machine. The bridge connects from
-    localhost without a browser session, so it authenticates with a token
-    instead of a cookie -- and only for that one path."""
+    """One token letting this server's own ttyd bridge dial the console
+    websocket of exactly one machine. The bridge connects from localhost
+    without a browser session, so it authenticates with a token instead of a
+    cookie -- and only for that one path. It lives exactly as long as that
+    ttyd (revoke_bridges() when it stops): with a 24 h expiry, a machine kept
+    longer got "could not attach" on every new terminal."""
     token = secrets.token_urlsafe(24)
-    _bridges[token] = (time.time() + BRIDGE_TTL, vm_id)
+    _bridges[token] = (float("inf"), vm_id)
     return token
+
+
+def revoke_bridges(vm_id: str) -> None:
+    for key, info in list(_bridges.items()):
+        if info[1] == vm_id:
+            _bridges.pop(key, None)
+
+
+def _client_ip(scope, headers) -> str:
+    """The visitor, for the login limiter. Behind a local proxy (cloudflared,
+    Aegis/Burrow, Codespaces) every request comes from 127.0.0.1, so eight bad
+    tries from anyone locked the real admin out: there, the proxy's own
+    client header names the visitor."""
+    ip = (scope.get('client') or ('unknown', 0))[0]
+    if ip in ('127.0.0.1', '::1', '::ffff:127.0.0.1'):
+        fwd = headers.get('cf-connecting-ip') or headers.get('x-forwarded-for', '').split(',')[0].strip()
+        if fwd: return fwd[:64]
+    return ip
 
 class AuthMiddleware:
     def __init__(self, app): self.app = app
@@ -64,9 +84,13 @@ class AuthMiddleware:
             return await reply(JSONResponse({'signedIn': signed, 'configured': configured}))
         if path == '/api/auth/login' and method == 'POST':
             if not configured: return await reply(JSONResponse({'detail':'Run ./run.sh to configure your login.'}, status_code=503))
-            ip = (scope.get('client') or ('unknown',0))[0]
+            ip = _client_ip(scope, headers)
             # Not a defaultdict access: succeeded logins must not leave a permanent
-            # per-IP entry behind (unbounded memory growth guard).
+            # per-IP entry behind (unbounded memory growth guard). Addresses that
+            # only ever failed are dropped once their window has passed.
+            if len(_attempts) > 1000:
+                for k, d in list(_attempts.items()):
+                    if not d or d[-1] < now - 600: _attempts.pop(k, None)
             attempts = _attempts.get(ip)
             if attempts is None: attempts = _attempts[ip] = deque()
             while attempts and attempts[0] < now - 600: attempts.popleft()

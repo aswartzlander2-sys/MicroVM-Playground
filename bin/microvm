@@ -43,10 +43,20 @@ stop_server() {
   if service_active; then systemctl --user stop "$service"; echo 'Stopped the user service.'; stopped=1; fi
   if pid=$(pid_of_server); then
     kill "$pid"
+    # it suspends running VMs first (up to MVMP_SHUTDOWN_WAIT each): starting a
+    # new server before it exits only lost the port to it
+    for _ in $(seq 1 180); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     echo "Stopped background server (PID $pid)."
     rm -f "$PIDFILE"
     stopped=1
   fi
+  # servers started some other way (by hand, an older script) that run this copy, as this user
+  for pid in $(pgrep -u "$(id -u)" -f "run_server.py" 2>/dev/null); do
+    [ -r "/proc/$pid/cwd" ] || continue
+    if [ "$(readlink -f "/proc/$pid/cwd")" = "$HERE" ] || tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq "$HERE/run_server.py"; then
+      kill "$pid" 2>/dev/null && { echo "Stopped another server of this copy (PID $pid)."; stopped=1; }
+    fi
+  done
   [ "$stopped" = 1 ] || echo 'The dashboard is not running.'
 }
 case "${1:-help}" in

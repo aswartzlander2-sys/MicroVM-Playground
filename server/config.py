@@ -75,6 +75,7 @@ USE_TTYD = os.environ.get("MVMP_TTYD_ENABLE", "auto").lower()   # auto | on | of
 
 # Set at startup so ttyd can point its bridge back at us.
 RUNTIME_PORT = int(os.environ.get("MVMP_PORT", "64732"))
+RUNTIME_HOST = os.environ.get("MVMP_HOST", "127.0.0.1")
 
 # --- server ------------------------------------------------------------------
 # Codespaces forwards ports from inside the container, so bind all interfaces

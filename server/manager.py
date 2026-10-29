@@ -33,7 +33,10 @@ def has_kvm() -> bool:
 
 
 def _firecracker_ready() -> bool:
-    return (has_kvm() and Path(C.FIRECRACKER_BIN).exists()
+    # Firecracker's tap networking needs root: picking it for a normal user
+    # only fails later, at the first launch.
+    root = hasattr(os, "geteuid") and os.geteuid() == 0
+    return (root and has_kvm() and Path(C.FIRECRACKER_BIN).exists()
             and C.KERNEL_PATH.exists() and C.BASE_ROOTFS.exists())
 
 
@@ -94,6 +97,7 @@ class Record:
     error: Optional[str] = None
     vm: object = None
     task: object = None
+    destroying: bool = False
 
     def view(self) -> VMView:
         return VMView(
@@ -142,6 +146,7 @@ class Manager:
         self._vms: dict[str, Record] = {}
         self._slots: set[int] = set()
         self._lock = asyncio.Lock()
+        self._bake_lock = asyncio.Lock()
         self._reaper: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------ probe
@@ -312,7 +317,7 @@ class Manager:
         self._vms[vm_id] = rec
 
         rec.image_label = self._image_label(spec.image)
-        if self.backend == "qemu" and not C.BASE_IMAGE.exists():
+        if self.backend == "qemu" and not C.BASE_IMAGE.exists() and (spec.image or catalog.DEFAULT_ID) in catalog.GOLDEN_IDS:
             # The shared golden image is missing: bake it once in the
             # background, then boot a clone. Every later machine is instant.
             rec.task = asyncio.create_task(self._prepare_golden(rec))
@@ -320,7 +325,16 @@ class Manager:
         try:
             rec.vm = self._make_vm(vm_id, slot, spec, name)
             await rec.vm.start()
+            # Deleted while it was starting: destroy() already let go of the
+            # record and its slot, so this VM must not live on unseen.
+            if self._vms.get(vm_id) is not rec or rec.destroying:
+                with contextlib.suppress(Exception):
+                    await rec.vm.stop(graceful=False)
+                if self.backend == "qemu":
+                    await asyncio.to_thread(shutil.rmtree, C.VMS_DIR / vm_id, True)
+                return rec
             rec.state = "running"
+            self._save_record(rec)
             # ttyd serves the terminal where it exists; the built-in console
             # websocket stays as the fallback (and as ttyd's own transport).
             from . import ttyd
@@ -331,7 +345,8 @@ class Manager:
             with contextlib.suppress(Exception):
                 if rec.vm is not None:
                     await rec.vm.stop(graceful=False)
-            self._slots.discard(rec.slot)
+            # The slot stays with the errored record until it is deleted:
+            # destroy() frees it, exactly once.
         return rec
 
     async def _prepare_golden(self, rec: Record) -> None:
@@ -355,8 +370,9 @@ class Manager:
         env["MVMP_STATE_DIR"] = str(C.STATE_DIR)
         env["MVMP_BASE_CACHE"] = str(C.STATE_DIR / "images" / "base")
         env.pop("MVMP_IMAGE", None)
+        # A fixed 8 GB: the golden's size becomes every later machine's minimum disk.
         args = [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "bake.py"),
-                "--distro", "debian", "--disk-gb", str(max(8, rec.spec.disk_gb)), "--mem-mib", str(max(1024, rec.spec.mem_mib)), "--vcpus", str(rec.spec.vcpus), "--out", "golden.qcow2"]
+                "--distro", "debian", "--disk-gb", "8", "--mem-mib", str(max(1024, rec.spec.mem_mib)), "--vcpus", str(rec.spec.vcpus), "--out", "golden.qcow2"]
         proc = None
         # _progress() reads this file to report real status on the machine card.
         progress_file = vm_dir / "progress.json"
@@ -365,11 +381,18 @@ class Manager:
             tmp.write_text(json.dumps({"phase": "golden", "message": "Building the shared Debian image once (this runs only for the first machine) — after this every new machine starts in seconds.", "percent": None}))
             os.replace(tmp, progress_file)
         await asyncio.to_thread(_write_progress)
+        partial = C.BASE_IMAGE.with_name(C.BASE_IMAGE.name + ".partial")
         try:
-            with (vm_dir / "prepare.log").open("wb") as log:
-                proc = await asyncio.create_subprocess_exec(*args, env=env, stdout=log,
-                        stderr=asyncio.subprocess.STDOUT, start_new_session=(os.name != "nt"))
-                result = await proc.wait()
+            # One bake at a time: a second machine created meanwhile waits for
+            # this one's golden instead of starting its own over the same files.
+            async with self._bake_lock:
+                if C.BASE_IMAGE.exists():
+                    result = 0
+                else:
+                    with (vm_dir / "prepare.log").open("wb") as log:
+                        proc = await asyncio.create_subprocess_exec(*args, env=env, stdout=log,
+                                stderr=asyncio.subprocess.STDOUT, start_new_session=(os.name != "nt"))
+                        result = await proc.wait()
             if result:
                 detail = (vm_dir / "prepare.log").read_text(errors="replace")[-1200:].strip()
                 raise RuntimeError("Image preparation failed: " + (detail or "see prepare.log"))
@@ -381,6 +404,9 @@ class Manager:
             rec.vm = QemuVM(rec.id, rec.slot, rec.spec.vcpus, rec.spec.mem_mib,
                             disk, rec.name, str(C.BASE_IMAGE), seed=seed)
             await rec.vm.start()
+            if self._vms.get(rec.id) is not rec or rec.destroying:
+                with contextlib.suppress(Exception): await rec.vm.stop(graceful=False)
+                return
             rec.state = "running"
             self._save_record(rec)
             marker.unlink(missing_ok=True)
@@ -398,6 +424,7 @@ class Manager:
                     await proc.wait()
             if rec.vm is not None:
                 with contextlib.suppress(Exception): await rec.vm.stop(graceful=False)
+            with contextlib.suppress(OSError): partial.unlink(missing_ok=True)
             await asyncio.to_thread(shutil.rmtree, vm_dir, True)
             raise
         except Exception as exc:
@@ -405,11 +432,11 @@ class Manager:
             rec.error = str(exc)
             if rec.vm is not None:
                 with contextlib.suppress(Exception): await rec.vm.stop(graceful=False)
-            # A failed bake must not leave a half-built golden behind.
-            with contextlib.suppress(OSError): C.BASE_IMAGE.unlink(missing_ok=True)
+            # A failed bake must not leave a half-built golden behind (bake.py
+            # only renames a finished one into place; a failed boot keeps it).
+            with contextlib.suppress(OSError): partial.unlink(missing_ok=True)
             (vm_dir / "progress.json").unlink(missing_ok=True)
-            # Release the slot/subnet: nothing holds it while the bake failed.
-            self._slots.discard(rec.slot)
+            # The slot stays with the errored record; destroy() frees it once.
         finally:
             rec.task = None
 
@@ -492,6 +519,7 @@ class Manager:
         try:
             await rec.vm.suspend()
             rec.state = "stopped"
+            self._save_record(rec)
         except Exception as exc:
             rec.state = "error"
             rec.error = str(exc)
@@ -508,11 +536,15 @@ class Manager:
         try:
             await rec.vm.resume()
             rec.state = "running"
+            self._save_record(rec)
             from . import ttyd
             await asyncio.to_thread(ttyd.start_for, vm_id, C.RUNTIME_PORT)
         except Exception as exc:
             rec.state = "error"
             rec.error = str(exc)
+            # a half-started VM keeps its disk lock and ports: stop it
+            with contextlib.suppress(Exception):
+                await rec.vm.stop(graceful=False)
         return rec
 
     # ---------------------------------------------------------------- destroy
@@ -520,6 +552,11 @@ class Manager:
         rec = self._vms.get(vm_id)
         if rec is None:
             return False
+        # Twice at once (the reaper and a click, a double click): the second
+        # waits for nothing and frees nothing -- one slot is freed exactly once.
+        if rec.destroying:
+            return True
+        rec.destroying = True
         rec.state = "stopping"
         from . import publish
         await publish.close_vm(self, vm_id)

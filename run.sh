@@ -150,9 +150,14 @@ Type=simple
 WorkingDirectory="$escaped_here"
 Environment=MVMP_BACKEND=qemu
 Environment=MVMP_PORT=64732
-ExecStart="$escaped_here/.venv/bin/python" "$escaped_here/run_server.py" --host 127.0.0.1 --port 64732
+Environment=MVMP_HOST=${MVMP_HOST:-127.0.0.1}
+ExecStart="$escaped_here/.venv/bin/python" "$escaped_here/run_server.py"
 Restart=on-failure
 RestartSec=5
+# Stop the server first and let it suspend its VMs (it stops them itself);
+# the default killed every QEMU at the same moment, with no clean shutdown.
+KillMode=mixed
+TimeoutStopSec=300
 
 [Install]
 WantedBy=default.target
@@ -175,7 +180,8 @@ if [ "$backend" = qemu ] && [ -f "$HOME/.config/systemd/user/robo-universal.serv
        && tr '\0' ' ' < "/proc/$oldpid/cmdline" 2>/dev/null | grep -Fq "$HERE/run_server.py"; then
       echo '  Stopping an older background server before starting the service.'
       kill "$oldpid" 2>/dev/null || true
-      for _ in 1 2 3 4 5; do kill -0 "$oldpid" 2>/dev/null || break; sleep 1; done
+      # it suspends its VMs before exiting; a kill -9 after 5 s orphaned them
+      for _ in $(seq 1 180); do kill -0 "$oldpid" 2>/dev/null || break; sleep 1; done
       kill -9 "$oldpid" 2>/dev/null || true
       rm -f "$pidfile"
     fi

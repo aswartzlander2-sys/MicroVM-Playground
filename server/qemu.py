@@ -186,6 +186,9 @@ class QemuVM:
         try:
             await asyncio.wait_for(self._connected.wait(), timeout=30)
         except asyncio.TimeoutError:
+            # don't leave it running: it holds the disk's write lock and the SSH port
+            with contextlib.suppress(Exception):
+                await self._halt(graceful=False)
             raise QemuError("QEMU did not connect its serial console within 30s")
 
         # SLIRP hands out a fixed layout; no DHCP snooping required.
