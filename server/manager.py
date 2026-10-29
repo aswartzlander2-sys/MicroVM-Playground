@@ -149,7 +149,7 @@ class Manager:
         if self.backend == "container":
             return C.DISK_MIN_GB      # containers share the host filesystem
         if self.backend == "qemu":
-            return max(8, C.DISK_MIN_GB)
+            return C.base_image_gb()
         if self.backend == "firecracker" and C.BASE_ROOTFS.exists():
             gb = -(-C.BASE_ROOTFS.stat().st_size // (1024 ** 3))
             return max(C.DISK_MIN_GB, int(gb))
@@ -201,7 +201,7 @@ class Manager:
                                  "Boots take tens of seconds.")
                 else:
                     notes.append("Hardware acceleration active via %s." % accel)
-            notes.append("Guest images are downloaded and prepared on VM creation and removed when deleted.")
+            notes.append("The first machine bakes the shared Debian image (a few minutes); after that, machines start in seconds from copy-on-write clones.")
 
         else:  # firecracker
             if net.icmp_state() is False:
@@ -295,10 +295,10 @@ class Manager:
         self._vms[vm_id] = rec
 
         rec.image_label = self._image_label(spec.image)
-        if self.backend == "qemu" and spec.image in {item["id"] for item in catalog.list_images("qemu")}:
-            # Preparing a full OS may take minutes; return immediately and expose
-            # starting/error states to the dashboard rather than timing out.
-            rec.task = asyncio.create_task(self._prepare_qemu(rec))
+        if self.backend == "qemu" and not C.BASE_IMAGE.exists():
+            # The shared golden image is missing: bake it once in the
+            # background, then boot a clone. Every later machine is instant.
+            rec.task = asyncio.create_task(self._prepare_golden(rec))
             return rec
         try:
             rec.vm = self._make_vm(vm_id, slot, spec, name)
@@ -317,7 +317,14 @@ class Manager:
             self._slots.discard(rec.slot)
         return rec
 
-    async def _prepare_qemu(self, rec: Record) -> None:
+    async def _prepare_golden(self, rec: Record) -> None:
+        """Bake the shared golden image once, then boot a clone of it.
+
+        This mirrors the upstream flow: the multi-minute package install runs
+        exactly once on this host; every machine created afterwards clones the
+        resulting golden image through a copy-on-write overlay and starts in
+        seconds.
+        """
         import signal, sys
         from .qemu import QemuVM
         vm_dir = C.VMS_DIR / rec.id
@@ -325,20 +332,20 @@ class Manager:
         marker = vm_dir / ".robo-provisioning"
         marker.touch(mode=0o600, exist_ok=True)
         env = os.environ.copy()
-        env["MVMP_STATE_DIR"] = str(vm_dir / "provision")
-        # One shared 350 MB base download for every VM ever created on this
-        # server; each VM still gets its own golden image and seed.
-        env["MVMP_BASE_CACHE"] = str(C.STATE_DIR / "images")
+        # Bake into the server's own images directory so the golden lands at
+        # C.BASE_IMAGE; downloaded base images go into a shared cache subfolder
+        # so they never show up as separate OS entries in the catalog.
+        env["MVMP_STATE_DIR"] = str(C.STATE_DIR)
+        env["MVMP_BASE_CACHE"] = str(C.STATE_DIR / "images" / "base")
         env.pop("MVMP_IMAGE", None)
-        # Each VM gets its own base, seed and logs. No shared downloaded image.
         args = [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "bake.py"),
-                "--distro", "debian", "--hostname", rec.name, "--disk-gb", str(max(8, rec.spec.disk_gb)), "--mem-mib", str(max(1024, rec.spec.mem_mib)), "--vcpus", str(rec.spec.vcpus), "--out", "golden.qcow2"]
+                "--distro", "debian", "--disk-gb", str(max(8, rec.spec.disk_gb)), "--mem-mib", str(max(1024, rec.spec.mem_mib)), "--vcpus", str(rec.spec.vcpus), "--out", "golden.qcow2"]
         proc = None
         # _progress() reads this file to report real status on the machine card.
         progress_file = vm_dir / "progress.json"
         def _write_progress() -> None:
             tmp = vm_dir / "progress.json.tmp"
-            tmp.write_text(json.dumps({"phase": "download", "message": "Downloading and preparing the Debian image; package installation can take several minutes.", "percent": None}))
+            tmp.write_text(json.dumps({"phase": "golden", "message": "Building the shared Debian image once (this runs only for the first machine) — after this every new machine starts in seconds.", "percent": None}))
             os.replace(tmp, progress_file)
         await asyncio.to_thread(_write_progress)
         try:
@@ -349,9 +356,12 @@ class Manager:
             if result:
                 detail = (vm_dir / "prepare.log").read_text(errors="replace")[-1200:].strip()
                 raise RuntimeError("Image preparation failed: " + (detail or "see prepare.log"))
-            image = vm_dir / "provision" / "images" / "golden.qcow2"
+            if not C.BASE_IMAGE.exists():
+                raise RuntimeError("Image preparation produced no golden image at %s (see prepare.log)" % C.BASE_IMAGE)
+            C._image_gb_cache = None   # the golden just appeared; re-probe its virtual size
+            disk = max(rec.spec.disk_gb, self.min_disk_gb())
             rec.vm = QemuVM(rec.id, rec.slot, rec.spec.vcpus, rec.spec.mem_mib,
-                            max(8, rec.spec.disk_gb), rec.name, str(image))
+                            disk, rec.name, str(C.BASE_IMAGE))
             await rec.vm.start()
             rec.state = "running"
             self._save_record(rec)
@@ -377,8 +387,8 @@ class Manager:
             rec.error = str(exc)
             if rec.vm is not None:
                 with contextlib.suppress(Exception): await rec.vm.stop(graceful=False)
-            # Failed preparations leave no downloaded disk images behind.
-            await asyncio.to_thread(shutil.rmtree, vm_dir / "provision", True)
+            # A failed bake must not leave a half-built golden behind.
+            with contextlib.suppress(OSError): C.BASE_IMAGE.unlink(missing_ok=True)
             (vm_dir / "progress.json").unlink(missing_ok=True)
             # Release the slot/subnet: nothing holds it while the bake failed.
             self._slots.discard(rec.slot)
@@ -386,7 +396,7 @@ class Manager:
             rec.task = None
 
     def _save_record(self, rec: Record) -> None:
-        if self.backend != "qemu" or rec.spec.image not in {"debian", "ubuntu", "arch", "rocky", "almalinux"}:
+        if self.backend != "qemu":
             return
         directory = C.VMS_DIR / rec.id
         directory.mkdir(parents=True, exist_ok=True)
@@ -417,8 +427,8 @@ class Manager:
                 data = json.loads(record.read_text())
                 if data.get("id") != directory.name: continue
                 spec = CreateVM.model_validate(data["spec"])
-                if spec.image not in {"debian", "ubuntu", "arch", "rocky", "almalinux"}: continue
-                image = directory / "provision" / "images" / "golden.qcow2"
+                # Prefer the shared golden; older VMs keep their private image.
+                image = C.BASE_IMAGE if C.BASE_IMAGE.is_file() else directory / "provision" / "images" / "golden.qcow2"
                 if not image.is_file() or not (directory / "disk.qcow2").is_file(): continue
                 slot = self._alloc_slot()
                 rec = Record(id=directory.name, name=data["name"], spec=spec, slot=slot,
@@ -434,11 +444,9 @@ class Manager:
         rec = self._vms.get(vm_id)
         if rec is None:
             return None
-        if self.backend == "qemu" and name != rec.name:
-            raise RuntimeError("Renaming a running guest is not supported; its label is its hostname")
         rec.name = name
-        # The guest's own hostname was fixed at boot and cannot follow; this is
-        # the label you see in the UI.
+        # Guests are copy-on-write clones of the shared golden image, so the UI
+        # name is only a label; no hostname tie-in to protect.
         with contextlib.suppress(Exception):
             if rec.vm is not None:
                 rec.vm.name = name
@@ -556,7 +564,7 @@ class Manager:
         with contextlib.suppress(Exception):
             ttyd.stop_all()
         for vm_id, rec in list(self._vms.items()):
-            if self.backend == "qemu" and rec.spec.image in {"debian", "ubuntu", "arch", "rocky", "almalinux"} and rec.state in ("running", "stopped") and rec.vm:
+            if self.backend == "qemu" and rec.state in ("running", "stopped") and rec.vm:
                 if rec.state == "running":
                     from . import publish
                     await publish.close_vm(self, vm_id)

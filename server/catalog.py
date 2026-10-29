@@ -125,8 +125,7 @@ def list_images(backend: str) -> list[dict]:
             })
         return items
     if backend == "qemu":
-        return [{"id": "debian", "label": "Debian 12 · original playground", "ref": "on-demand", "ready": False,
-                 "note": "original Debian image, built when the VM is created"}]
+        return _disk_images("*.qcow2", C.BASE_IMAGE.name)
     if backend == "firecracker":
         return _disk_images("*.ext4", C.BASE_ROOTFS.name)
     return [{"id": "default", "label": "simulated", "ref": "-", "ready": True,
@@ -162,8 +161,10 @@ def label_for(backend: str, image_id: str) -> Optional[str]:
         entry = CONTAINER_IMAGES.get(image_id)
         return entry[0] if entry else None
     if backend == "qemu":
-        from tools.provision import IMAGES
-        return IMAGES[image_id][0] + " · CLI" if image_id in IMAGES else None
+        for item in list_images(backend):
+            if item["id"] == image_id:
+                return item["label"]
+        return None
     if image_id == DEFAULT_ID:
         return {"qemu": C.BASE_IMAGE.stem,
                 "firecracker": C.BASE_ROOTFS.stem}.get(backend, "default")

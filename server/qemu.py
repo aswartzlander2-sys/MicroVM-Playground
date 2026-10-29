@@ -190,7 +190,7 @@ class QemuVM:
         """Copy-on-write clone of the golden image -- instant, near-zero bytes."""
         args = [qemu_img, "create", "-q", "-f", "qcow2",
                 "-F", "qcow2", "-b", str(self.base_image), str(self.overlay)]
-        target_gb = self.disk_gb
+        target_gb = max(self.disk_gb, C.base_image_gb())
         args.append("%dG" % target_gb)
         p = await asyncio.to_thread(
             subprocess.run, args, capture_output=True, text=True)
