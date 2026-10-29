@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Provisioned artefacts: rebuilt by setup.ps1 / setup.sh / tools/bake.py
+images/
+*.qcow2
+*.ext4
+*.iso
+vmlinux
+server.log
+server.pid
+*.orig
+
+.microvm-setup-complete

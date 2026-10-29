@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Robo Universal CLI. This file may be reached through ~/.local/bin/microvm.
+set -euo pipefail
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+HERE=$(cd "$(dirname "$SELF")/.." && pwd)
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/robo-universal"
+PIDFILE="$STATE/server.pid"
+service=robo-universal.service
+python="$HERE/.venv/bin/python"
+
+usage() {
+  cat <<'EOF'
+microvm — Robo Universal command line
+
+  microvm start          Install dependencies if needed and start the dashboard
+  microvm stop           Stop the dashboard (keeps completed VMs and their disks)
+  microvm restart        Stop and start the dashboard
+  microvm status         Show dashboard status
+  microvm logs           Follow dashboard logs (Ctrl+C to stop watching)
+  microvm passwd         Reset the admin password (username stays the same)
+  microvm login-reset    Reset the admin username and password
+  microvm update         Update Python dependencies, then restart the dashboard
+  microvm doctor         Check QEMU, login and service availability
+  microvm url            Print the local dashboard address
+  microvm help           Show this help
+
+The default address is http://127.0.0.1:45952. Live publishing requires Aegis.
+EOF
+}
+pid_of_server() {
+  local pid
+  [[ -f "$PIDFILE" ]] || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq "$HERE/run_server.py" || return 1
+  printf '%s' "$pid"
+}
+service_active() { systemctl --user is-active --quiet "$service" 2>/dev/null; }
+stop_server() {
+  local pid stopped=0
+  if service_active; then systemctl --user stop "$service"; echo 'Stopped the user service.'; stopped=1; fi
+  if pid=$(pid_of_server); then
+    kill "$pid"
+    echo "Stopped background server (PID $pid)."
+    rm -f "$PIDFILE"
+    stopped=1
+  fi
+  [ "$stopped" = 1 ] || echo 'The dashboard is not running.'
+}
+case "${1:-help}" in
+  help|-h|--help) usage ;;
+  start) shift; exec "$HERE/run.sh" "$@" ;;
+  stop) stop_server ;;
+  restart) stop_server; exec "$HERE/run.sh" ;;
+  status)
+    if service_active; then echo 'Running as a systemd user service.'
+    elif pid=$(pid_of_server); then echo "Running in the background (PID $pid)."
+    else echo 'Not running.'; exit 1; fi
+    echo 'Dashboard: http://127.0.0.1:45952' ;;
+  logs)
+    if service_active; then exec journalctl --user -u "$service" -f
+    else mkdir -p "$STATE"; touch "$STATE/server.log"; exec tail -f "$STATE/server.log"; fi ;;
+  passwd|login-reset)
+    [ -x "$python" ] || { echo 'Run ./run.sh to set up the environment first.' >&2; exit 1; }
+    cd "$HERE"
+    if [ "$1" = passwd ]; then "$python" -m server.credentials --passwd; else "$python" -m server.credentials --reset; fi
+    echo 'Existing browser sessions are signed out. Close already-open terminal connections too.' ;;
+  update)
+    [ -x "$python" ] || { echo 'Run ./run.sh first.' >&2; exit 1; }
+    "$python" -m pip install --upgrade -r "$HERE/requirements.txt"
+    echo 'Python dependencies updated. This ZIP has no configured source-code updater.'
+    stop_server
+    exec "$HERE/run.sh" ;;
+  doctor)
+    printf 'Python environment: '; [ -x "$python" ] && echo ready || echo missing
+    printf 'QEMU: '; command -v qemu-system-x86_64 || echo missing
+    printf 'qemu-img: '; command -v qemu-img || echo missing
+    printf 'systemd user service: '; if systemctl --user show-environment >/dev/null 2>&1; then echo available; else echo unavailable; fi
+    printf 'Aegis socket: '; [ -S "${ROBO_BURROW_SOCKET:-$HOME/.local/share/aegis/data/control.sock}" ] && echo available || echo unavailable
+    echo 'Images are downloaded on VM creation.' ;;
+  url) echo 'http://127.0.0.1:45952' ;;
+  *) echo "Unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac
