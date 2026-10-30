@@ -65,34 +65,25 @@ $('#closepick').onclick=()=>{$('#termpick').classList.add('hidden');pickerVM=nul
 $('#pickbuiltin').onclick=()=>{if(!pickerVM||!vms.some(v=>v.id===pickerVM))return;if($('#pickremember').checked)localStorage.setItem('robo-terminal','builtin');let id=pickerVM;$('#termpick').classList.add('hidden');openConsole(id,'builtin')};
 $('#pickttyd').onclick=()=>{if(!pickerVM||!vms.some(v=>v.id===pickerVM))return;if($('#pickremember').checked)localStorage.setItem('robo-terminal','ttyd');let id=pickerVM;$('#termpick').classList.add('hidden');openConsole(id,'ttyd')};
 
-function teardownConsole(){if(socket){socket.onclose=null;try{socket.close()}catch(e){}socket=null}if(resizeFn){window.removeEventListener('resize',resizeFn);resizeFn=null}if(term){try{term.dispose()}catch(e){}term=null}const f=$('#ttydframe');f.hidden=true;f.src='about:blank';$('#secretrow').hidden=true;$('#secretval').value=''}
-/* ── blind sending: the secret-input path ──
-   The guest's tty may echo whatever this browser sends (that is exactly how
-   a typed password leaks on screen with programs that leave echo on). The
-   "quiet window" drops every byte the guest sends back for a beat after we
-   push a secret or a resize, so nothing typed through the password field —
-   and no injected stty chatter — can ever appear on screen. Real password
-   prompts (sudo, ssh, su) are safe anyway: those programs turn echo off
-   themselves. */
+function teardownConsole(){if(socket){socket.onclose=null;try{socket.close()}catch(e){}socket=null}if(resizeFn){window.removeEventListener('resize',resizeFn);resizeFn=null}if(term){try{term.dispose()}catch(e){}term=null}const f=$('#ttydframe');f.hidden=true;f.src='about:blank'}
+/* ── echo suppression ──
+   A real tty already handles passwords (sudo/ssh/su turn echo off), so no
+   special password row is needed. The one blind window that remains is for
+   PASTE: the guest may echo what this browser sends, and a quiet beat after
+   a resize avoids visible stty chatter. */
 let quietUntil=0;
 function quiet(ms){quietUntil=Date.now()+ms}
 function rawSend(data){if(socket&&socket.readyState===1)socket.send(new TextEncoder().encode(data))}
-const KEYMAP=new Map([['ctrl+c','\x03'],['ctrl+d','\x04'],['ctrl+z','\x1a'],['ctrl+bslash','\x1c'],['esc','\x1b'],['ctrl+l','\x0c'],['ctrl+u','\x15'],['reset','\x1bc']]);
 const FONTS=[10,11,12,13,14,16,18,21];const fontSize={n:3};fontSize.get=()=>FONTS[fontSize.n];
 $('#consolecopy').onclick=()=>{if(!term)return;navigator.clipboard?.writeText(term.getSelection()||'').then(()=>toast('Copied selection')).catch(()=>toast('Copy failed — select text first'))};
-$('#consolepaste').onclick=()=>{navigator.clipboard?.readText().then(t=>{if(t)rawSend(t.replace(/\r?\n/g,'\r'));term&&term.focus()}).catch(()=>toast('Clipboard is blocked — use Ctrl+Shift+V'))};
-$('#keysel').onchange=()=>{let v=$('#keysel').value;if(!v)return;$('#keysel').value='';rawSend(KEYMAP.get(v)||'');term&&term.focus()};
-$('#consolesecret').onclick=()=>{let row=$('#secretrow');row.hidden=!row.hidden;if(!row.hidden)$('#secretval').focus()};
-function sendSecret(){let val=$('#secretval').value;if(!val)return;$('#secretval').value='';$('#secretrow').hidden=true;quiet(280);rawSend(val+'\r');term&&term.focus()}
-$('#secretsend').onclick=sendSecret;
-$('#secretval').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();sendSecret()}};
+$('#consolepaste').onclick=()=>{navigator.clipboard?.readText().then(t=>{if(t){quiet(280);rawSend(t.replace(/\r?\n/g,'\r'))}term&&term.focus()}).catch(()=>toast('Clipboard is blocked — use Ctrl+Shift+V'))};
 function setFontSize(delta){let n=Math.min(FONTS.length-1,Math.max(0,fontSize.n+delta));if(n===fontSize.n)return;fontSize.n=n;if(term){term.options.fontSize=FONTS[n];refitConsole()}}
 $('#fontup').onclick=()=>setFontSize(1);
 $('#fontdown').onclick=()=>setFontSize(-1);
 function syncConsoleChrome(vm){let both=host.terminal==='ttyd'&&!!vm.terminal_url;$('#termswitch').hidden=!both;$('#swBuiltin').classList.toggle('is-on',termMode==='builtin');$('#swTtyd').classList.toggle('is-on',termMode==='ttyd');$('#consoledot').className='cdot st-'+esc(vm.state);$('#consolemeta').textContent=(termMode==='ttyd'?('terminal: ttyd '+(host.ttyd||'')):'terminal: built-in')+' · UTF-8 · truecolor';
   /* These tools ride on the built-in xterm only: ttyd's iframe has its own
      native copy/paste, so hiding the buttons avoids promising both. */
-  for(const id of ['consolecopy','consolepaste','consolesecret','keysel','fontdown','fontup']){const el=document.getElementById(id);if(el)el.hidden=termMode!=='builtin'}
+  for(const id of ['consolecopy','consolepaste','fontdown','fontup']){const el=document.getElementById(id);if(el)el.hidden=termMode!=='builtin'}
   $('#swBuiltin').classList.toggle('is-on',termMode==='builtin');$('#swTtyd').classList.toggle('is-on',termMode==='ttyd')}
 function startTtydFrame(vm){$('#terminal').hidden=true;$('#ttydframe').hidden=false;$('#ttydframe').src=vm.terminal_url||('/terminal/'+encodeURIComponent(consoleVM));$('#btnclear').hidden=true;$('#consolestatus').textContent='connected'}
 function openConsole(id,mode='builtin'){closeConsoleCore(false);let vm=vms.find(v=>v.id===id);if(!vm)return;consoleVM=id;termMode=(host.terminal==='ttyd'&&vm.terminal_url)?mode:'builtin';
