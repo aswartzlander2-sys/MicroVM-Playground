@@ -98,6 +98,10 @@ async def state():
 
 async def create(rec,guest_port,sub,access):
     if not 1<=guest_port<=65535: raise PublishError('Port must be between 1 and 65535')
+    if not sub:
+        # Leaving the label empty is not an error: the port itself is a fine,
+        # collision-free name (port-3000.robo-universe.top).
+        sub = 'port-%d' % guest_port
     if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',sub): raise PublishError('Name must be a valid single DNS label (1–63 characters).')
     if access!='public': raise PublishError('Private access is not implemented; no route was published.')
     if rec.state!='running' or not hasattr(rec.vm,'host_forward'): raise PublishError('A running QEMU machine is required.')

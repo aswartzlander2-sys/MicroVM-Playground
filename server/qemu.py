@@ -94,9 +94,19 @@ class QemuVM:
 
     def __init__(self, vm_id: str, slot: int, vcpus: int, mem_mib: int, disk_gb: int,
                  name: str = "", image: Optional[str] = None,
-                 seed: Optional[str] = None):
+                 seed: Optional[str] = None,
+                 internet: bool = False):
         self.id = vm_id
         self.name = name or vm_id[:8]
+        # Network posture, chosen at creation: with outbound disabled (the
+        # default) SLIRP runs in "restricted" mode -- the guest can neither
+        # reach the internet nor anything on the host or LAN, not even this
+        # dashboard. Inbound host forwards (the SSH management port and every
+        # published port) keep working, because those are connections the
+        # HOST initiates; the guest simply gets no outbound connectivity at
+        # all until it was created -- or is later reprovisioned -- with
+        # internet access.
+        self.outbound = bool(internet)
         self.slot = slot
         self.vcpus = vcpus
         self.mem_mib = mem_mib
@@ -214,6 +224,14 @@ class QemuVM:
         if accel == "tcg" and self.vcpus > 1:
             accel = "tcg,thread=multi"
 
+        netdev = "user,id=net0"
+        if not self.outbound:
+            # restrict=on makes SLIRP itself refuse to forward anything the
+            # guest dials: the NAT edge is closed, not filtered by rules the
+            # guest could inspect or work around.
+            netdev += ",restrict=on"
+        if self.ssh_port:
+            netdev += ",hostfwd=tcp:127.0.0.1:%d-:22" % self.ssh_port
         argv = [
             qemu,
             # -nodefaults is deliberately NOT used: it strips devices the stock
@@ -226,8 +244,7 @@ class QemuVM:
             "-m", str(self.mem_mib),
             # virtio everywhere: far less emulation work than legacy devices
             "-drive", "file=%s,if=virtio,format=qcow2,cache=writeback,discard=unmap" % self.overlay,
-            "-netdev", "user,id=net0" + (",hostfwd=tcp:127.0.0.1:%d-:22" % self.ssh_port
-                                         if self.ssh_port else ""),
+            "-netdev", netdev,
             "-device", "virtio-net-pci,netdev=net0",
             # Without an RNG the guest stalls for ages waiting on entropy.
             "-object", "rng-random,id=rng0,filename=/dev/urandom" if os.name != "nt"

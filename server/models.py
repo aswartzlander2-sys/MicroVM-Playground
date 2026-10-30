@@ -15,6 +15,9 @@ class CreateVM(BaseModel):
     disk_gb: int = Field(default=C.DEFAULT_DISK_GB, ge=C.DISK_MIN_GB, le=C.DISK_MAX_GB)
     ttl: Literal["never", "15m", "1h", "4h", "12h"] = "1h"
     image: str = Field(default="default", max_length=32)
+    # Guests are isolated from the host, the LAN and the internet by default.
+    # Publishing requires the guest to be created (or re-created) with this on.
+    internet: bool = False
 
     @field_validator("image")
     @classmethod
@@ -50,6 +53,7 @@ class VMView(BaseModel):
     image: str = "default"
     image_label: Optional[str] = None
     progress: Optional[dict] = None
+    internet: bool = False                # guest was created with outbound internet
     can_suspend: bool = False             # only VMs with no TTL may be stopped
 
 

@@ -27,7 +27,7 @@ setInterval(()=>{const now=Date.now();document.querySelectorAll('.u-uptime').for
 let createWired=false,ttlSel='never';
 function syncTtlChips(){document.querySelectorAll('#ttlchips [data-ttl]').forEach(b=>{let on=b.dataset.ttl===ttlSel;b.classList.toggle('is-on',on);b.setAttribute('aria-checked',on?'true':'false')});$('#ttlvalue').value=ttlSel}
 function syncCreateSummary(){let g=n=>$('#createform').querySelector('[name='+n+']');
-$('#createsummary').innerHTML=`<b>${esc(g('vcpus')?.value??'—')}</b> vCPU · <b>${esc(g('mem_mib')?.value??'—')}</b> MiB memory · <b>${esc(g('disk_gb')?.value??'—')}</b> GB disk · auto-destroy <b>${esc(ttlSel==='never'?'until deleted':ttlSel)}</b>`}
+$('#createsummary').innerHTML=`<b>${esc(g('vcpus')?.value??'—')}</b> vCPU · <b>${esc(g('mem_mib')?.value??'—')}</b> MiB memory · <b>${esc(g('disk_gb')?.value??'—')}</b> GB disk · network <b>${$('#guestnet')?.checked?'outbound internet':'isolated (default)'}</b> · auto-destroy <b>${esc(ttlSel==='never'?'until deleted':ttlSel)}</b>`}
 function openCreate(id){
   const select=$('#imageselect');
   select.innerHTML=images.map(i=>`<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('');
@@ -39,6 +39,7 @@ function openCreate(id){
     $('#ttlchips').innerHTML=['15m','1h','4h','12h','never'].map(v=>`<button type="button" class="chip-btn" role="radio" aria-checked="false" data-ttl="${v}">${v==='never'?'Never':v}</button>`).join('');
     document.querySelectorAll('#ttlchips [data-ttl]').forEach(b=>b.onclick=()=>{ttlSel=b.dataset.ttl;syncTtlChips();syncCreateSummary()});
     ['vcpus','mem_mib','disk_gb'].forEach(n=>$('#createform').querySelector('[name='+n+']').addEventListener('input',syncCreateSummary));
+    $('#guestnet').addEventListener('change',syncCreateSummary);
   }
   syncTtlChips();
   $('#launch').disabled=!images.length;
@@ -46,7 +47,7 @@ function openCreate(id){
   $('#createerror').textContent='';$('#modal').classList.remove('hidden');
 }
 $('#cancelcreate').onclick=()=>$('#modal').classList.add('hidden');
-$('#createform').onsubmit=async e=>{e.preventDefault();let f=new FormData(e.target),payload=Object.fromEntries(f);for(let k of ['vcpus','mem_mib','disk_gb'])payload[k]=Number(payload[k]);$('#launch').disabled=true;$('#launch').textContent='Launching…';try{let vm=await api('/api/vms',{method:'POST',body:JSON.stringify(payload)});$('#modal').classList.add('hidden');location.hash='vms';await refresh();if(vm.error)toast(vm.error);else toast(vm.state==='starting'?'Downloading the OS. Progress appears on the machine card.':'Machine created')}catch(err){$('#createerror').textContent=err.message}finally{$('#launch').disabled=false;$('#launch').textContent='Launch machine'}};
+$('#createform').onsubmit=async e=>{e.preventDefault();let f=new FormData(e.target),payload=Object.fromEntries(f);payload.internet=!!$('#guestnet')?.checked;for(let k of ['vcpus','mem_mib','disk_gb'])payload[k]=Number(payload[k]);$('#launch').disabled=true;$('#launch').textContent='Launching…';try{let vm=await api('/api/vms',{method:'POST',body:JSON.stringify(payload)});$('#modal').classList.add('hidden');location.hash='vms';await refresh();if(vm.error)toast(vm.error);else toast(vm.state==='starting'?'Downloading the OS. Progress appears on the machine card.':'Machine created')}catch(err){$('#createerror').textContent=err.message}finally{$('#launch').disabled=false;$('#launch').textContent='Launch machine'}};
 // ------------------------------------------------------------- terminal flow
 // Picker (built-in vs ttyd, rememberable) -> console modal with a live switch.
 let consoleVM=null,termMode='builtin',pickerVM=null;
@@ -59,14 +60,44 @@ $('#closepick').onclick=()=>{$('#termpick').classList.add('hidden');pickerVM=nul
 $('#pickbuiltin').onclick=()=>{if(!pickerVM||!vms.some(v=>v.id===pickerVM))return;if($('#pickremember').checked)localStorage.setItem('robo-terminal','builtin');let id=pickerVM;$('#termpick').classList.add('hidden');openConsole(id,'builtin')};
 $('#pickttyd').onclick=()=>{if(!pickerVM||!vms.some(v=>v.id===pickerVM))return;if($('#pickremember').checked)localStorage.setItem('robo-terminal','ttyd');let id=pickerVM;$('#termpick').classList.add('hidden');openConsole(id,'ttyd')};
 
-function teardownConsole(){if(socket){socket.onclose=null;try{socket.close()}catch(e){}socket=null}if(resizeFn){window.removeEventListener('resize',resizeFn);resizeFn=null}if(term){try{term.dispose()}catch(e){}term=null}const f=$('#ttydframe');f.hidden=true;f.src='about:blank'}
-function syncConsoleChrome(vm){let both=host.terminal==='ttyd'&&!!vm.terminal_url;$('#termswitch').hidden=!both;$('#swBuiltin').classList.toggle('is-on',termMode==='builtin');$('#swTtyd').classList.toggle('is-on',termMode==='ttyd');$('#consoledot').className='cdot st-'+esc(vm.state);$('#consolemeta').textContent=(termMode==='ttyd'?('terminal: ttyd '+(host.ttyd||'')):'terminal: built-in')+' · UTF-8 · truecolor'}
+function teardownConsole(){if(socket){socket.onclose=null;try{socket.close()}catch(e){}socket=null}if(resizeFn){window.removeEventListener('resize',resizeFn);resizeFn=null}if(term){try{term.dispose()}catch(e){}term=null}const f=$('#ttydframe');f.hidden=true;f.src='about:blank';$('#secretrow').hidden=true;$('#secretval').value=''}
+/* ── blind sending: the secret-input path ──
+   The guest's tty may echo whatever this browser sends (that is exactly how
+   a typed password leaks on screen with programs that leave echo on). The
+   "quiet window" drops every byte the guest sends back for a beat after we
+   push a secret or a resize, so nothing typed through the password field —
+   and no injected stty chatter — can ever appear on screen. Real password
+   prompts (sudo, ssh, su) are safe anyway: those programs turn echo off
+   themselves. */
+let quietUntil=0;
+function quiet(ms){quietUntil=Date.now()+ms}
+function rawSend(data){if(socket&&socket.readyState===1)socket.send(new TextEncoder().encode(data))}
+const KEYMAP=new Map([['ctrl+c','\x03'],['ctrl+d','\x04'],['ctrl+z','\x1a'],['ctrl+bslash','\x1c'],['esc','\x1b'],['ctrl+l','\x0c'],['ctrl+u','\x15'],['reset','\x1bc']]);
+const FONTS=[10,11,12,13,14,16,18,21];const fontSize={n:3};fontSize.get=()=>FONTS[fontSize.n];
+$('#consolecopy').onclick=()=>{if(!term)return;navigator.clipboard?.writeText(term.getSelection()||'').then(()=>toast('Copied selection')).catch(()=>toast('Copy failed — select text first'))};
+$('#consolepaste').onclick=()=>{navigator.clipboard?.readText().then(t=>{if(t)rawSend(t.replace(/\r?\n/g,'\r'));term&&term.focus()}).catch(()=>toast('Clipboard is blocked — use Ctrl+Shift+V'))};
+$('#keysel').onchange=()=>{let v=$('#keysel').value;if(!v)return;$('#keysel').value='';rawSend(KEYMAP.get(v)||'');term&&term.focus()};
+$('#consolesecret').onclick=()=>{let row=$('#secretrow');row.hidden=!row.hidden;if(!row.hidden)$('#secretval').focus()};
+function sendSecret(){let val=$('#secretval').value;if(!val)return;$('#secretval').value='';$('#secretrow').hidden=true;quiet(280);rawSend(val+'\r');term&&term.focus()}
+$('#secretsend').onclick=sendSecret;
+$('#secretval').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();sendSecret()}};
+function setFontSize(delta){let n=Math.min(FONTS.length-1,Math.max(0,fontSize.n+delta));if(n===fontSize.n)return;fontSize.n=n;if(term){term.options.fontSize=FONTS[n];refitConsole()}}
+$('#fontup').onclick=()=>setFontSize(1);
+$('#fontdown').onclick=()=>setFontSize(-1);
+function syncConsoleChrome(vm){let both=host.terminal==='ttyd'&&!!vm.terminal_url;$('#termswitch').hidden=!both;$('#swBuiltin').classList.toggle('is-on',termMode==='builtin');$('#swTtyd').classList.toggle('is-on',termMode==='ttyd');$('#consoledot').className='cdot st-'+esc(vm.state);$('#consolemeta').textContent=(termMode==='ttyd'?('terminal: ttyd '+(host.ttyd||'')):'terminal: built-in')+' · UTF-8 · truecolor';
+  /* These tools ride on the built-in xterm only: ttyd's iframe has its own
+     native copy/paste, so hiding the buttons avoids promising both. */
+  for(const id of ['consolecopy','consolepaste','consolesecret','keysel','fontdown','fontup']){const el=document.getElementById(id);if(el)el.hidden=termMode!=='builtin'}
+  $('#swBuiltin').classList.toggle('is-on',termMode==='builtin');$('#swTtyd').classList.toggle('is-on',termMode==='ttyd')}
 function startTtydFrame(vm){$('#terminal').hidden=true;$('#ttydframe').hidden=false;$('#ttydframe').src=vm.terminal_url||('/terminal/'+encodeURIComponent(consoleVM));$('#btnclear').hidden=true;$('#consolestatus').textContent='connected'}
 function openConsole(id,mode='builtin'){closeConsoleCore(false);let vm=vms.find(v=>v.id===id);if(!vm)return;consoleVM=id;termMode=(host.terminal==='ttyd'&&vm.terminal_url)?mode:'builtin';
   $('#consoletitle').textContent=vm.name||'Terminal';$('#consolevcpu').textContent=vm.vcpus+' vCPU';$('#consolevcpu').hidden=false;$('#consolemem').textContent=fmtMem(vm.mem_mib);$('#consolemem').hidden=false;$('#consoleip').textContent=vm.ip||'—';$('#consoleip').hidden=false;
   $('#consolemodal').classList.remove('hidden');$('#consolestatus').textContent='connecting…';syncConsoleChrome(vm);
   if(termMode==='ttyd'){startTtydFrame(vm);return}
-  $('#btnclear').hidden=false;$('#terminal').hidden=false;term=new Terminal({cursorBlink:true,fontSize:13,fontFamily:'monospace',theme:{background:'#090b0b',foreground:'#e7e7df'}});let fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open($('#terminal'));fit.fit();socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/api/vms/${encodeURIComponent(id)}/console`);socket.binaryType='arraybuffer';socket.onopen=()=>{$('#consolestatus').textContent='connected';socket.send(JSON.stringify({type:'resize',rows:term.rows,cols:term.cols}));term.focus()};socket.onmessage=e=>term.write(typeof e.data==='string'?e.data:new Uint8Array(e.data));const activeTerm=term;socket.onclose=()=>{if(term===activeTerm){activeTerm.write('\r\n\x1b[90mConnection closed — press ↻ to reconnect.\x1b[0m');if($('#consolestatus'))$('#consolestatus').textContent='closed'}};term.onData(d=>{if(socket?.readyState===1)socket.send(new TextEncoder().encode(d))});resizeFn=()=>{fit.fit();if(socket?.readyState===1)socket.send(JSON.stringify({type:'resize',rows:term.rows,cols:term.cols}))};window.addEventListener('resize',resizeFn)}
+  $('#btnclear').hidden=false;$('#terminal').hidden=false;term=new Terminal({cursorBlink:true,fontSize:fontSize.get(),fontFamily:'monospace',theme:{background:'#090b0b',foreground:'#e7e7df'}});let fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open($('#terminal'));fit.fit();socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/api/vms/${encodeURIComponent(id)}/console`);socket.binaryType='arraybuffer';socket.onopen=()=>{$('#consolestatus').textContent='connected';quiet(250);socket.send(JSON.stringify({type:'resize',rows:term.rows,cols:term.cols}));term.focus()};
+  socket.onmessage=e=>{if(Date.now()<quietUntil)return;    // a blind window swallows the guest's echo of what was just sent
+    term.write(typeof e.data==='string'?e.data:new Uint8Array(e.data))};
+  const activeTerm=term;socket.onclose=()=>{if(term===activeTerm){activeTerm.write('\r\n\x1b[90mConnection closed — press ↻ to reconnect.\x1b[0m');if($('#consolestatus'))$('#consolestatus').textContent='closed'}};term.onData(d=>{if(socket?.readyState===1)socket.send(new TextEncoder().encode(d))});resizeFn=()=>{fit.fit();if(socket?.readyState===1){quiet(250);socket.send(JSON.stringify({type:'resize',rows:term.rows,cols:term.cols}))}};window.addEventListener('resize',resizeFn)}
 function closeConsoleCore(hide=true){teardownConsole();consoleVM=null;if(hide)$('#consolemodal').classList.add('hidden')}
 $('#closeconsole').onclick=()=>closeConsoleCore(true);
 $('#swBuiltin').onclick=()=>{if(!consoleVM||termMode==='builtin')return;let vm=vms.find(v=>v.id===consoleVM);if(!vm)return;teardownConsole();termMode='builtin';if(localStorage.getItem('robo-terminal'))localStorage.setItem('robo-terminal','builtin');syncConsoleChrome(vm);$('#consolestatus').textContent='connecting…';openConsole(consoleVM,'builtin')};

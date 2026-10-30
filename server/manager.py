@@ -109,6 +109,7 @@ class Record:
             expires_at=self.expires_at, error=self.error,
             terminal_url=self.terminal_url,
             image=self.spec.image, image_label=self.image_label,
+            internet=self.spec.internet,
             progress=self._progress(),
             # Stopping only makes sense for something that is not on a timer:
             # a VM that will be destroyed at expiry gains nothing from being
@@ -296,7 +297,8 @@ class Manager:
             if C.BASE_IMAGE.exists():
                 seed = self._make_seed(vm_id, name,
                                        "arch" if "arch" in (spec.image or "") else "debian")
-            return QemuVM(vm_id, slot, spec.vcpus, spec.mem_mib, disk, name, img, seed=seed)
+            return QemuVM(vm_id, slot, spec.vcpus, spec.mem_mib, disk, name, img,
+                          seed=seed, internet=spec.internet)
         from .firecracker import FirecrackerVM
         return FirecrackerVM(vm_id, slot, spec.vcpus, spec.mem_mib, disk, name, img)
 
@@ -402,7 +404,8 @@ class Manager:
             disk = max(rec.spec.disk_gb, self.min_disk_gb())
             seed = self._make_seed(rec.id, rec.name, "debian")
             rec.vm = QemuVM(rec.id, rec.slot, rec.spec.vcpus, rec.spec.mem_mib,
-                            disk, rec.name, str(C.BASE_IMAGE), seed=seed)
+                            disk, rec.name, str(C.BASE_IMAGE), seed=seed,
+                            internet=rec.spec.internet)
             await rec.vm.start()
             if self._vms.get(rec.id) is not rec or rec.destroying:
                 with contextlib.suppress(Exception): await rec.vm.stop(graceful=False)
@@ -479,7 +482,8 @@ class Manager:
                 rec = Record(id=directory.name, name=data["name"], spec=spec, slot=slot,
                              state="stopped", created_at=float(data["created_at"]), expires_at=data.get("expires_at"))
                 rec.image_label = self._image_label(spec.image)
-                rec.vm = QemuVM(rec.id, slot, spec.vcpus, spec.mem_mib, max(8, spec.disk_gb), rec.name, str(image))
+                rec.vm = QemuVM(rec.id, slot, spec.vcpus, spec.mem_mib, max(8, spec.disk_gb), rec.name, str(image),
+                                internet=spec.internet)
                 self._vms[rec.id] = rec
             except (OSError, ValueError, KeyError, RuntimeError, TypeError):
                 continue  # leave unrecognized data alone; never delete user files
