@@ -3,7 +3,7 @@
 Routes are explicitly public. State is journaled before API side effects. On
 restart stale routes are cleaned, not automatically rebound to reused ports.
 """
-import asyncio, contextlib, json, os, re, shutil, socket, sys, tempfile, uuid
+import asyncio, contextlib, json, os, re, shutil, socket, sys, tempfile, time, uuid
 from pathlib import Path
 import httpx
 from . import config as C
@@ -112,10 +112,47 @@ def allocate():
 
 async def state():
     c=read(CONFIG,{})
-    zs=config_zones(c)
+    zs=[dict(z,wildcard=await zone_wildcard(z)) for z in config_zones(c)]
     return {'connected':bool(c.get('token')), 'zone':(zs[0] if zs else None), 'zones':zs, 'cloudflared':bool(shutil.which('cloudflared')), 'pending_cleanup':sum(1 for r in load() if r.get('phase')!='active')}
 
-async def wait_dns(hostname,timeout=25):
+_DOH='https://cloudflare-dns.com/dns-query'
+
+async def doh_answers(name):
+    """Public A answers for a name via 1.1.1.1's JSON DoH endpoint."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r=await client.get(_DOH,params={'name':name,'type':'A'},headers={'accept':'application/dns-json'})
+        body=r.json()
+        return [a.get('data') for a in body.get('Answer',[]) if a.get('type')==1 and a.get('data')]
+    except Exception:
+        return []
+
+async def _wild_answers(zone):
+    """Answers a WILDCARD/resolver would give for any name in this zone.
+
+    A random never-published label is resolved publicly: whatever comes back
+    is what the catch-all record (Aegis relay, NAT, parked host) serves, and
+    exactly what a freshly published name must NOT resolve to for 'ready' to
+    be truthful.
+    """
+    probe='wildcheck-'+uuid.uuid4().hex[:12]+'.'+zone['name']
+    return frozenset(a for a in await doh_answers(probe) if a)
+
+_wild_cache={}  # zone_id -> (timestamp, wildcard exists)
+
+async def zone_wildcard(zone):
+    """True when this zone has a catch-all record answering unknown names."""
+    hit=_wild_cache.get(zone['id'])
+    if hit and time.time()-hit[0]<600: return hit[1]
+    try:
+        answers=await _wild_answers(zone)
+        flag=bool(answers)
+    except Exception:
+        flag=hit[1] if hit else False
+    _wild_cache[zone['id']]=(time.time(),flag)
+    return flag
+
+async def wait_dns(hostname,forbidden=frozenset(),timeout=25):
     """Resolve the new CNAME from the host before calling it 'ready'.
 
     Between the Cloudflare API returning 2xx and the record actually being
@@ -123,15 +160,26 @@ async def wait_dns(hostname,timeout=25):
     as DNS_PROBE_FINISHED_NXDOMAIN when a link is opened too early. Polling
     here (and reporting 'provisioning' until it resolves) turns that dead
     window into visible status instead of a broken link.
+
+    'forbidden' is the zone catch-all's answer set: a wildcard domain makes
+    every name resolve instantly, so accepting any answer would mistake the
+    other service (e.g. Aegis relay 404) for a working route. The name only
+    counts as ready when it answers with something the wildcard cannot
+    produce -- or with anything at all when the zone has no catch-all.
     """
     loop=asyncio.get_running_loop()
     deadline=loop.time()+timeout
     while loop.time()<deadline:
+        addrs=set()
         try:
-            await loop.getaddrinfo(hostname,443)
-            return True
+            info=await loop.getaddrinfo(hostname,443)
+            addrs|={i[4][0] for i in info}
         except (socket.gaierror,OSError):
-            await asyncio.sleep(2.5)
+            pass
+        addrs|=set(await doh_answers(hostname))
+        usable={a for a in addrs if a and (not forbidden or a not in forbidden)}
+        if usable: return True
+        await asyncio.sleep(2.5)
     return False
 
 async def create(rec,guest_port,sub,access,zone_id=None):
@@ -166,6 +214,24 @@ async def create(rec,guest_port,sub,access,zone_id=None):
         row={'id':identifier,'vm':rec.id,'guest_port':guest_port,'host_port':hostport,'sub':sub,'hostname':hostname,'access':'public','zone_id':zone['id'],'account_id':zone['account_id'],'name':'robo-'+identifier,'phase':'pending'}
         rows.append(row);save(rows)
         try:
+            # Catch-all awareness: a zone answering unknown names (e.g. the
+            # Aegis relay wildcard) makes every name resolve BEFORE this
+            # record exists, so naive readiness checks go false-ready and
+            # the browser hits the catch-all instead of this machine.
+            wilds=await api('GET',f"/zones/{zone['id']}/dns_records",params={'name':'*.'+zone['name'],'per_page':5}) or []
+            wildcard=bool(wilds)
+            row['wildcard']=wildcard;save(rows)
+            forbidden=set()
+            if wildcard:
+                for w in wilds:
+                    if not w.get('proxied') and w.get('type')=='A' and w.get('content'): forbidden.add(w['content'])
+                forbidden|=set(await _wild_answers(zone))
+                row['wild_answers']=sorted(forbidden);save(rows)
+        except Exception:
+            try: await cleanup(row,rec)
+            except Exception: pass
+            raise
+        try:
             # Refuse to replace existing records, even records with a different type.
             existing=await api('GET',f"/zones/{zone['id']}/dns_records",params={'name':hostname})
             if existing: raise PublishError('That DNS name already exists; choose another name.')
@@ -183,11 +249,12 @@ async def create(rec,guest_port,sub,access,zone_id=None):
             if proc.returncode is not None: raise PublishError('cloudflared exited immediately. Check its installation and Cloudflare tunnel configuration.')
             dns=await api('POST',f"/zones/{zone['id']}/dns_records",{'type':'CNAME','name':hostname,'content':row['tunnel_id']+'.cfargotunnel.com','proxied':True,'ttl':1})
             row['dns_id']=dns['id'];save(rows)
-            # Prove the record answers before advertising the link as ready;
-            # otherwise the browser reports NXDOMAIN on first visit.
-            dns_ready=await wait_dns(hostname)
+            # Prove the record answers with OUR route before advertising the
+            # link as ready; otherwise the browser reports NXDOMAIN -- or,
+            # before this check, silently landed on a catch-all 404.
+            dns_ready=await wait_dns(hostname,forbidden=frozenset(forbidden),timeout=(60 if wildcard else 25))
             row.update(dns_checked=dns_ready,phase='active');save(rows)
-            return {'vm':rec.id,'guest_port':guest_port,'host_port':hostport,'tunnel':{'url':'https://'+hostname,'domain':zone['name'],'sub':sub,'access':'public','status':'ready' if dns_ready else 'provisioning'}}
+            return {'vm':rec.id,'guest_port':guest_port,'host_port':hostport,'tunnel':{'url':'https://'+hostname,'domain':zone['name'],'sub':sub,'access':'public','wildcard':wildcard,'status':'ready' if dns_ready else 'provisioning'}}
         except Exception:
             try: await cleanup(row,rec)
             except Exception: pass
@@ -235,14 +302,22 @@ async def reconcile(manager):
                 except Exception: pass # retain journal for retry; never silently forget resources
 
 async def listing():
-    result=[]
-    for r in load():
+    rows=load();mutated=False;result=[]
+    for r in rows:
         sub=r.get('sub','')
         host=r.get('hostname','')
         domain=host[len(sub)+1:] if sub and host.startswith(sub+'.') else host
         status=r.get('phase','')
-        if status=='active': status='ready' if r.get('dns_checked') else 'provisioning'
-        result.append({**r,'tunnel':{'url':'https://'+host,'domain':domain,'sub':sub,'status':status,'access':r.get('access','public')}})
+        if status=='active':
+            if not r.get('dns_checked'):
+                # Lazy re-check: once the name actually answers (not with the
+                # catch-all's answer), flip provisioning -> ready.
+                forbid=set(r.get('wild_answers') or [])
+                if await wait_dns(host,frozenset(forbid),timeout=1.2):
+                    r['dns_checked']=True;mutated=True
+            status='ready' if r.get('dns_checked') else 'provisioning'
+        result.append({**r,'tunnel':{'url':'https://'+host,'domain':domain,'sub':sub,'status':status,'wildcard':bool(r.get('wildcard')),'access':r.get('access','public')}})
+    if mutated: save(rows)
     return result
 
 async def close_vm(manager, vm_id):
