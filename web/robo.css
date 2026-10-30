@@ -603,6 +603,11 @@ html[data-theme='light'] .toast { box-shadow: 0 16px 40px -16px rgba(60, 45, 25,
   font-size: 12.5px; font-family: var(--mono);
 }
 .secretrow .hint { color: var(--muted); font-size: 10.5px; max-width: 300px; }
+.urlpreview {
+  margin: 2px 0 4px; font-size: 12px; color: var(--muted);
+}
+.urlpreview b { color: var(--text); font-family: var(--mono); font-size: 12.5px; }
+select:disabled { opacity: 0.55; cursor: not-allowed; }
 /* fullscreen = the console box itself, like upstream: header on top, terminal
    fills everything in between, status line at the bottom. Native API first,
    .is-max fallback when the browser refuses. */

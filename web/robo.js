@@ -1,4 +1,9 @@
-const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const $=s=>document.querySelector(s)||dummyEl();
+/* A detached placeholder: wiring a control that is absent (stale cached
+   markup, disabled feature) becomes a silent no-op instead of a TypeError
+   that aborts the whole script and leaves dialogs stuck open. */
+function dummyEl(){return dummyEl.d||(dummyEl.d=document.createElement('div'))}
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const known=[['debian','Debian 12','Original playground image with command-line tools.','debian','Original image']];
 let host={},images=[],vms=[],filter='all',query='',term=null,socket=null,resizeFn=null;
 async function api(path,opt={}){let r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});let data=await r.json().catch(()=>({}));if(!r.ok)throw Error(data.detail||'Request failed');return data}
@@ -38,8 +43,8 @@ function openCreate(id){
   if(!createWired){createWired=true;
     $('#ttlchips').innerHTML=['15m','1h','4h','12h','never'].map(v=>`<button type="button" class="chip-btn" role="radio" aria-checked="false" data-ttl="${v}">${v==='never'?'Never':v}</button>`).join('');
     document.querySelectorAll('#ttlchips [data-ttl]').forEach(b=>b.onclick=()=>{ttlSel=b.dataset.ttl;syncTtlChips();syncCreateSummary()});
-    ['vcpus','mem_mib','disk_gb'].forEach(n=>$('#createform').querySelector('[name='+n+']').addEventListener('input',syncCreateSummary));
-    $('#guestnet').addEventListener('change',syncCreateSummary);
+    ['vcpus','mem_mib','disk_gb'].forEach(n=>$('#createform').querySelector('[name='+n+']')?.addEventListener('input',syncCreateSummary));
+    $('#guestnet')?.addEventListener('change',syncCreateSummary);
   }
   syncTtlChips();
   $('#launch').disabled=!images.length;
@@ -133,20 +138,58 @@ function makeSlug(){let words=[['quiet','silver','happy','cosmic','gentle','brig
 function tokenTemplate(){let u=new URL('https://dash.cloudflare.com/profile/api-tokens');u.searchParams.set('permissionGroupKeys',JSON.stringify([{key:'zone',type:'read'},{key:'dns',type:'edit'},{key:'argotunnel',type:'edit'}]));u.searchParams.set('accountId','*');u.searchParams.set('zoneId','all');u.searchParams.set('name','Robo Universal Tunnel');return u.href}
 async function renderDomains(){
   $('#content').innerHTML=`<div class="intro"><div><h1>Domains & ports</h1><p>Connect Cloudflare directly to publish services from your machines.</p></div></div><div class="table" style="padding:24px;max-width:850px"><div class="eyebrow">CLOUDFLARE / DIRECT CONNECTION</div><h2>Connect your domain</h2><p class="notice">Create a token with Zone Read, DNS Edit and Cloudflare Tunnel Edit. Limit it to your account and zones. Paste it below; Robo stores it on the host to manage tunnels. Use HTTPS to access this dashboard.</p><a class="primary small" target="_blank" rel="noopener" href="${esc(tokenTemplate())}">Create Cloudflare token ↗</a><p class="notice">Review the permissions and resources on Cloudflare, create the token, and copy it here.</p><div class="fileauth"><input id="cftoken" type="password" placeholder="Cloudflare API token" autocomplete="off"><button class="primary small" id="cfconnect">Find domains</button></div><div id="cferror" class="error" role="alert"></div><div id="cfzones" class="fileauth"></div><div id="cfstatus" class="notice">Checking connection…</div><p class="notice">Publishing requires cloudflared installed on this Linux host. Each published port is public; private access is not available in this version. DNS and certificates can take time to become ready.</p></div>`;
-  const show=async()=>{try{let x=await api('/api/cloudflare/setup');$('#cfstatus').textContent=(x.connected?'Connected to '+x.zone.name+'. ':'Not connected. ')+(x.cloudflared?'cloudflared is installed.':'cloudflared is missing on this host.')+(x.pending_cleanup?' Some routes need cleanup.':'');if(x.connected){let b=document.createElement('button');b.className='ghost';b.textContent='Disconnect';b.onclick=async()=>{if(!confirm('Disconnect Cloudflare? Published ports must be removed first.'))return;try{await api('/api/cloudflare/setup',{method:'DELETE'});await show()}catch(e){$('#cferror').textContent=e.message}};$('#cfstatus').append(' ',b)}}catch(e){$('#cfstatus').textContent=e.message}};
-  $('#cfconnect').onclick=async()=>{let input=$('#cftoken');$('#cferror').textContent='';try{let r=await api('/api/cloudflare/zones',{method:'POST',body:JSON.stringify({token:input.value.trim().replace(/\s+/g,'')})});cfZones=r.zones;if(!cfZones.length)throw Error('No active zones found. The token connected but lists no zones you can use.');$('#cfzones').innerHTML=`<select id="cfzone" aria-label="Choose domain">${cfZones.map(z=>`<option value="${esc(z.id)}">${esc(z.name)}</option>`).join('')}</select><button class="primary small" id="cfsave">Connect domain</button>`;$('#cfsave').onclick=async()=>{try{await api('/api/cloudflare/setup/connect',{method:'POST',body:JSON.stringify({token:input.value.trim(),zone_id:$('#cfzone').value})});input.value='';$('#cfzones').innerHTML='';await show();toast('Cloudflare connected')}catch(e){$('#cferror').textContent=e.message}}}catch(e){$('#cferror').textContent=e.message}};
+  const show=async()=>{try{let x=await api('/api/cloudflare/setup');let zn=(x.connected&&Array.isArray(x.zones))?x.zones.length:0;$('#cfstatus').textContent=(x.connected?('Connected. '+zn+' domain'+(zn===1?'':'s')+' available: '+x.zones.map(z=>z.name).join(', '))
+:'Not connected. ')+(x.cloudflared?'cloudflared is installed.':'cloudflared is missing on this host.')+(x.pending_cleanup?' Some routes need cleanup.':'');if(x.connected){let b=document.createElement('button');b.className='ghost';b.textContent='Disconnect';b.onclick=async()=>{if(!confirm('Disconnect Cloudflare? Published ports must be removed first.'))return;try{await api('/api/cloudflare/setup',{method:'DELETE'});await show()}catch(e){$('#cferror').textContent=e.message}};$('#cfstatus').append(' ',b)}}catch(e){$('#cfstatus').textContent=e.message}};
+  $('#cfconnect').onclick=async()=>{let input=$('#cftoken');$('#cferror').textContent='';try{let r=await api('/api/cloudflare/zones',{method:'POST',body:JSON.stringify({token:input.value.trim().replace(/\s+/g,'')})});cfZones=r.zones;if(!cfZones.length)throw Error('No active zones found. The token connected but lists no zones you can use.');$('#cfzones').innerHTML=`<select id="cfzone" aria-label="Choose default domain">${cfZones.map(z=>`<option value="${esc(z.id)}">${esc(z.name)}</option>`).join('')}</select><button class="primary small" id="cfsave">Connect domains</button><span class="hint">All ${cfZones.length} of your Cloudflare domains become available for publishing; the one you pick is the default.</span>`;$('#cfsave').onclick=async()=>{try{await api('/api/cloudflare/setup/connect',{method:'POST',body:JSON.stringify({token:input.value.trim(),zone_id:$('#cfzone').value})});input.value='';$('#cfzones').innerHTML='';await show();toast('Cloudflare connected')}catch(e){$('#cferror').textContent=e.message}}}catch(e){$('#cferror').textContent=e.message}};
   await show();
 }
 
-let portVM='',portsWired=false;
+let portVM='',portsWired=false,portsZones=[];
 function makePortName(port){let v=vms.find(v=>v.id===portVM),base=((v&&v.name)||'vm').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40-1-String(port).length).replace(/-+$/,'')||'vm';return base+'-'+port}
-function openPorts(id){portVM=id;$('#guestport').value=3000;$('#portlabel').value=makePortName(3000);
-  if(!portsWired){portsWired=true;document.querySelectorAll('#accesschips [data-access]').forEach(b=>b.onclick=()=>{$('#portaccess').value=b.dataset.access;document.querySelectorAll('#accesschips [data-access]').forEach(x=>x.classList.toggle('is-on',x===b))})}
+function portSuggestions(port){return [makePortName(port),'port-'+port,'app-'+port]}
+/* The address block: domain select (every connected Cloudflare domain),
+   subdomain suggestions locked until a domain is picked, and a free-text
+   custom field that always wins over the picker. */
+async function populatePortDomains(){
+  const sel=$('#portdomain'),pick=$('#subpick');
+  try{let x=await api('/api/cloudflare/setup');portsZones=(x.connected&&Array.isArray(x.zones)&&x.zones.length)?x.zones:[]}catch(e){portsZones=[]}
+  if(portsZones.length){
+    sel.innerHTML=portsZones.map(z=>`<option value="${esc(z.id)}">${esc(z.name)}</option>`).join('');
+    sel.disabled=false;
+    $('#domainhint').textContent=portsZones.length>1?`${portsZones.length} connected domains — pick one, then a subdomain below.`:'Pick a subdomain suggestion or type your own.';
+  }else{
+    sel.innerHTML='<option value="">No connected domain</option>';sel.disabled=true;
+    pick.disabled=true;pick.innerHTML='<option value="">Connect Cloudflare first</option>';
+    $('#domainhint').textContent='No Cloudflare connection. Open “Domains & ports” in the sidebar to connect one.';
+  }
+  portSubSuggestions();
+}
+function portSubSuggestions(){
+  const pick=$('#subpick'),port=$('#guestport').value;
+  pick.innerHTML='<option value="">Custom — type your own</option>'+portSuggestions(port).map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');
+  pick.disabled=!$('#portdomain').value||!portsZones.length;
+  pick.value=portSuggestions(port)[0];
+  $('#portlabel').value=pick.value||'';
+  syncPortPreview();
+}
+function syncPortPreview(){
+  const z=portsZones.find(z=>z.id===$('#portdomain').value);
+  const sub=($('#portlabel').value.trim()||'port-'+$('#guestport').value).toLowerCase().replace(/\s+/g,'-');
+  const ok=!!z&&/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(sub);
+  $('#urlpreview').hidden=!ok;
+  if(ok)$('#prevurl').textContent='https://'+sub+'.'+z.name;
+}
+function openPorts(id){portVM=id;$('#guestport').value=3000;
+  if(!portsWired){portsWired=true;document.querySelectorAll('#accesschips [data-access]').forEach(b=>b.onclick=()=>{$('#portaccess').value=b.dataset.access;document.querySelectorAll('#accesschips [data-access]').forEach(x=>x.classList.toggle('is-on',x===b))});
+    $('#portdomain').addEventListener('change',()=>{$('#domainhint').textContent=$('#portdomain').value?'Pick a subdomain suggestion or type your own.':'Choose a domain.';portSubSuggestions()});
+    $('#subpick').addEventListener('change',()=>{if($('#subpick').value){$('#portlabel').value=$('#subpick').value}syncPortPreview()});
+    $('#portlabel').addEventListener('input',()=>{$('#subpick').value=$('#portlabel').value?'':portSuggestions($('#guestport').value)[0];syncPortPreview()});
+    $('#guestport').addEventListener('change',()=>{portSubSuggestions()});
+  }
   $('#portaccess').value='public';document.querySelectorAll('#accesschips [data-access]').forEach(x=>x.classList.toggle('is-on',x.dataset.access==='public'));
-  $('#porterror').textContent='';$('#portsmodal').classList.remove('hidden');loadPorts()}
-$('#guestport').onchange=()=>{$('#portlabel').value=makePortName($('#guestport').value)};
-async function loadPorts(){try{let rows=await api('/api/publishing');let own=rows.filter(r=>r.vm===portVM);$('#publishedlist').innerHTML=own.length?own.map(r=>`<div class="pub-row"><div class="pub-info"><strong>Port ${esc(r.guest_port)}</strong><span class="pub-access">${esc(r.access==='login'?'Aegis sign-in':'Public')}</span>${r.tunnel?.url?`<a href="${esc(r.tunnel.url)}" target="_blank" rel="noopener">${esc(r.tunnel.url)} ↗</a>`:'<span class="pub-wait">Address provisioning or unavailable</span>'}</div><button class="ghost sm danger" data-unpublish="${esc(r.guest_port)}">Unpublish</button></div>`).join(''):'<span class="pub-wait">No ports published yet.</span>';document.querySelectorAll('[data-unpublish]').forEach(b=>b.onclick=async()=>{if(!confirm('Unpublish this address?'))return;try{await api('/api/vms/'+encodeURIComponent(portVM)+'/ports/'+b.dataset.unpublish,{method:'DELETE'});await loadPorts()}catch(e){$('#porterror').textContent=e.message}})}catch(e){$('#publishedlist').textContent='Publishing unavailable: '+e.message}}
-$('#portform').onsubmit=async e=>{e.preventDefault();let access=$('#portaccess').value;if(access==='public'&&!confirm('This will expose the guest service publicly to the internet. Continue?'))return;$('#porterror').textContent='';$('#portpublish').disabled=true;try{let x=await api('/api/vms/'+encodeURIComponent(portVM)+'/ports',{method:'POST',body:JSON.stringify({port:Number($('#guestport').value),sub:$('#portlabel').value,access})});toast('Route created; Cloudflare connection and certificate may still be provisioning');await loadPorts()}catch(e){$('#porterror').textContent=e.message}finally{$('#portpublish').disabled=false}};$('#closeports').onclick=()=>$('#portsmodal').classList.add('hidden');
+  $('#urlpreview').hidden=true;$('#porterror').textContent='';$('#portsmodal').classList.remove('hidden');loadPorts();populatePortDomains()}
+async function loadPorts(){try{let rows=await api('/api/publishing');let own=rows.filter(r=>r.vm===portVM);$('#publishedlist').innerHTML=own.length?own.map(r=>{let st=r.tunnel?.status||r.phase,dns=st==='provisioning'?`<span class="pub-access" title="The DNS record was created; resolvers may need a moment. Retry the link shortly or clear the browser cache.">DNS propagating…</span>`:'<span class="pub-access">'+esc(r.access==='login'?'Aegis sign-in':'Public')+'</span>';return `<div class="pub-row"><div class="pub-info"><strong>Port ${esc(r.guest_port)}</strong>${r.tunnel?.domain?`<span class="pub-access">${esc(r.tunnel.domain)}</span>`:''}${dns}${r.tunnel?.url?`<a href="${esc(r.tunnel.url)}" target="_blank" rel="noopener">${esc(r.tunnel.url)} ↗</a>`:'<span class="pub-wait">Address provisioning or unavailable</span>'}</div><button class="ghost sm danger" data-unpublish="${esc(r.guest_port)}">Unpublish</button></div>`}).join(''):'<span class="pub-wait">No ports published yet.</span>';document.querySelectorAll('[data-unpublish]').forEach(b=>b.onclick=async()=>{if(!confirm('Unpublish this address?'))return;try{await api('/api/vms/'+encodeURIComponent(portVM)+'/ports/'+b.dataset.unpublish,{method:'DELETE'});await loadPorts()}catch(e){$('#porterror').textContent=e.message}})}catch(e){$('#publishedlist').textContent='Publishing unavailable: '+e.message}}
+$('#portform').onsubmit=async e=>{e.preventDefault();let access=$('#portaccess').value,zone_id=$('#portdomain').value||null;if(access==='public'&&!confirm('This will expose the guest service publicly to the internet. Continue?'))return;$('#porterror').textContent='';$('#portpublish').disabled=true;try{let x=await api('/api/vms/'+encodeURIComponent(portVM)+'/ports',{method:'POST',body:JSON.stringify({port:Number($('#guestport').value),sub:$('#portlabel').value.trim(),access,zone_id})});toast(x.tunnel?.status==='ready'?'Published and resolving: '+x.tunnel.url:'Route created; DNS is propagating (a fresh NXDOMAIN clears within a minute or two)');await loadPorts()}catch(e){$('#porterror').textContent=e.message}finally{$('#portpublish').disabled=false}};$('#closeports').onclick=()=>$('#portsmodal').classList.add('hidden');
 
 // Keep the dashboard live: poll every 2s while a machine is starting, every 4s
 // otherwise, always on the VMs tab. The busy-guard stops overlapping fetches.

@@ -148,7 +148,8 @@ async def publishing_create(vm_id: str, request: Request):
     try:
         port = data.get("port")
         if type(port) is not int: raise publish.PublishError("Port must be a number")
-        return await publish.create(rec, port, str(data.get("sub", "")), str(data.get("access", "login")))
+        return await publish.create(rec, port, str(data.get("sub", "")), str(data.get("access", "login")),
+                                    data.get("zone_id") or None)
     except publish.PublishError as exc: raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc: raise HTTPException(status_code=502, detail="Port setup failed: " + str(exc)[:300])
 

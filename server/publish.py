@@ -35,6 +35,19 @@ def cfg():
     if not c.get('token'): raise PublishError('Connect a Cloudflare API token first.')
     return c
 
+def config_zones(c):
+    """Every domain the saved token can publish under.
+
+    New configs hold 'zones'; single-zone configs ('zone': {...}) are migrated
+    here rather than on disk, so upgrading is additive and reversible.
+    """
+    if not isinstance(c,dict): return []
+    zs=c.get('zones')
+    if isinstance(zs,list) and zs:
+        return [z for z in zs if isinstance(z,dict) and z.get('id') and z.get('name')]
+    z=c.get('zone')
+    return [z] if isinstance(z,dict) and z.get('id') and z.get('name') else []
+
 async def api(method,path,payload=None,params=None,token=None,allow_missing=False):
     secret=token or cfg()['token']
     try:
@@ -80,8 +93,13 @@ async def connect(token,zone_id):
         options=await zones(token)
         zone=next((z for z in options if z['id']==zone_id),None)
         if not zone: raise PublishError('Zone not found or token lacks Zone Read permission.')
-        write(CONFIG,{'token':token,'zone':zone})
-        return {'connected':True,'zone':zone}
+        # Multi-domain connection: every zone the token can read stays
+        # available in the publishing UI, with the chosen one as the default.
+        # Legacy single-zone configs are still honored by config_zones() even
+        # if this write never happens.
+        ordered=[zone]+[z for z in options if z['id']!=zone_id]
+        write(CONFIG,{'token':token,'zones':ordered,'zone':zone})
+        return {'connected':True,'zones':ordered,'zone':zone}
 
 async def disconnect():
     async with lock:
@@ -94,14 +112,35 @@ def allocate():
 
 async def state():
     c=read(CONFIG,{})
-    return {'connected':bool(c.get('token')), 'zone':c.get('zone'), 'cloudflared':bool(shutil.which('cloudflared')), 'pending_cleanup':sum(1 for r in load() if r.get('phase')!='active')}
+    zs=config_zones(c)
+    return {'connected':bool(c.get('token')), 'zone':(zs[0] if zs else None), 'zones':zs, 'cloudflared':bool(shutil.which('cloudflared')), 'pending_cleanup':sum(1 for r in load() if r.get('phase')!='active')}
 
-async def create(rec,guest_port,sub,access):
+async def wait_dns(hostname,timeout=25):
+    """Resolve the new CNAME from the host before calling it 'ready'.
+
+    Between the Cloudflare API returning 2xx and the record actually being
+    served, a fresh lookup returns NXDOMAIN -- exactly what a browser shows
+    as DNS_PROBE_FINISHED_NXDOMAIN when a link is opened too early. Polling
+    here (and reporting 'provisioning' until it resolves) turns that dead
+    window into visible status instead of a broken link.
+    """
+    loop=asyncio.get_running_loop()
+    deadline=loop.time()+timeout
+    while loop.time()<deadline:
+        try:
+            await loop.getaddrinfo(hostname,443)
+            return True
+        except (socket.gaierror,OSError):
+            await asyncio.sleep(2.5)
+    return False
+
+async def create(rec,guest_port,sub,access,zone_id=None):
     if not 1<=guest_port<=65535: raise PublishError('Port must be between 1 and 65535')
     if not sub:
         # Leaving the label empty is not an error: the port itself is a fine,
         # collision-free name (port-3000.robo-universe.top).
         sub = 'port-%d' % guest_port
+    sub = sub.strip().lower()
     if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',sub): raise PublishError('Name must be a valid single DNS label (1–63 characters).')
     if access!='public': raise PublishError('Private access is not implemented; no route was published.')
     if rec.state!='running' or not hasattr(rec.vm,'host_forward'): raise PublishError('A running QEMU machine is required.')
@@ -110,9 +149,20 @@ async def create(rec,guest_port,sub,access):
     if not sys.platform.startswith('linux'): raise PublishError('Direct publishing currently requires Linux.')
     async with lock:
         if rec.state!='running': raise PublishError('The machine is no longer running.')
-        c=cfg(); zone=c['zone']; rows=load()
+        c=cfg(); zones_all=config_zones(c)
+        if not zones_all: raise PublishError('This connection has no usable domain. Reconnect Cloudflare.')
+        zone=next((z for z in zones_all if z.get('id')==zone_id),None)
+        if zone is None and zone_id:
+            raise PublishError('That domain is not connected to this dashboard. Reconnect Cloudflare or pick a connected domain.')
+        # Default: the connection's primary (first-chosen) domain.
+        if zone is None: zone=zones_all[0]
+        rows=load()
         if any(r['vm']==rec.id and r['guest_port']==guest_port for r in rows): raise PublishError('That guest port is already published or awaiting cleanup.')
-        hostname=sub+'.'+zone['name']; hostport=allocate(); identifier=uuid.uuid4().hex
+        hostname=sub+'.'+zone['name']
+        # Uniqueness is per-hostname, so the same label cannot be double-booked
+        # within a zone or clash with a sibling zone of the same account.
+        if any(r.get('hostname')==hostname for r in rows): raise PublishError('That DNS name is already published; choose another subdomain.')
+        hostport=allocate(); identifier=uuid.uuid4().hex
         row={'id':identifier,'vm':rec.id,'guest_port':guest_port,'host_port':hostport,'sub':sub,'hostname':hostname,'access':'public','zone_id':zone['id'],'account_id':zone['account_id'],'name':'robo-'+identifier,'phase':'pending'}
         rows.append(row);save(rows)
         try:
@@ -132,8 +182,12 @@ async def create(rec,guest_port,sub,access):
             await asyncio.sleep(1)
             if proc.returncode is not None: raise PublishError('cloudflared exited immediately. Check its installation and Cloudflare tunnel configuration.')
             dns=await api('POST',f"/zones/{zone['id']}/dns_records",{'type':'CNAME','name':hostname,'content':row['tunnel_id']+'.cfargotunnel.com','proxied':True,'ttl':1})
-            row['dns_id']=dns['id'];row['phase']='active';save(rows)
-            return {'vm':rec.id,'guest_port':guest_port,'host_port':hostport,'tunnel':{'url':'https://'+hostname,'access':'public','status':'provisioning'}}
+            row['dns_id']=dns['id'];save(rows)
+            # Prove the record answers before advertising the link as ready;
+            # otherwise the browser reports NXDOMAIN on first visit.
+            dns_ready=await wait_dns(hostname)
+            row.update(dns_checked=dns_ready,phase='active');save(rows)
+            return {'vm':rec.id,'guest_port':guest_port,'host_port':hostport,'tunnel':{'url':'https://'+hostname,'domain':zone['name'],'sub':sub,'access':'public','status':'ready' if dns_ready else 'provisioning'}}
         except Exception:
             try: await cleanup(row,rec)
             except Exception: pass
@@ -181,7 +235,15 @@ async def reconcile(manager):
                 except Exception: pass # retain journal for retry; never silently forget resources
 
 async def listing():
-    return [{**r,'tunnel':{'url':'https://'+r['hostname'],'status':r['phase'],'access':'public'}} for r in load()]
+    result=[]
+    for r in load():
+        sub=r.get('sub','')
+        host=r.get('hostname','')
+        domain=host[len(sub)+1:] if sub and host.startswith(sub+'.') else host
+        status=r.get('phase','')
+        if status=='active': status='ready' if r.get('dns_checked') else 'provisioning'
+        result.append({**r,'tunnel':{'url':'https://'+host,'domain':domain,'sub':sub,'status':status,'access':r.get('access','public')}})
+    return result
 
 async def close_vm(manager, vm_id):
     async with lock:
