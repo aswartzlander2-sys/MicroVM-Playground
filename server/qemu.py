@@ -194,12 +194,15 @@ class QemuVM:
         self._tasks.append(loop.create_task(self._watch_stderr()))
 
         try:
-            await asyncio.wait_for(self._connected.wait(), timeout=30)
+            # Generous deadline: under heavy host load (other guests, image
+            # work, backups) a healthy QEMU can take a while before it dials
+            # the serial socket; 30s turned a slow boot into a hard failure.
+            await asyncio.wait_for(self._connected.wait(), timeout=90)
         except asyncio.TimeoutError:
             # don't leave it running: it holds the disk's write lock and the SSH port
             with contextlib.suppress(Exception):
                 await self._halt(graceful=False)
-            raise QemuError("QEMU did not connect its serial console within 30s")
+            raise QemuError("QEMU never connected its serial console (90s). Check disk space, /dev/kvm availability and host load, then delete and recreate the machine.")
 
         # SLIRP hands out a fixed layout; no DHCP snooping required.
         self.ip, self.gateway = "10.0.2.15", "10.0.2.2"

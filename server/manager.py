@@ -326,21 +326,36 @@ class Manager:
             return rec
         try:
             rec.vm = self._make_vm(vm_id, slot, spec, name)
+        except Exception as exc:
+            rec.state = "error"
+            rec.error = str(exc)
+            self._save_record(rec)
+            return rec
+        # Boot in the background: creation responds immediately, the dialog
+        # closes at once and the machine card carries 'starting'/progress,
+        # including any boot failure. This mirrors the upstream flow, where a
+        # fresh machine appears instantly and grows into a running one.
+        rec.task = asyncio.create_task(self._boot(rec))
+        return rec
+
+    async def _boot(self, rec: Record) -> None:
+        """Bring an already-registered machine up; errors land on the record."""
+        try:
             await rec.vm.start()
             # Deleted while it was starting: destroy() already let go of the
             # record and its slot, so this VM must not live on unseen.
-            if self._vms.get(vm_id) is not rec or rec.destroying:
+            if self._vms.get(rec.id) is not rec or rec.destroying:
                 with contextlib.suppress(Exception):
                     await rec.vm.stop(graceful=False)
                 if self.backend == "qemu":
-                    await asyncio.to_thread(shutil.rmtree, C.VMS_DIR / vm_id, True)
-                return rec
+                    await asyncio.to_thread(shutil.rmtree, C.VMS_DIR / rec.id, True)
+                return
             rec.state = "running"
             self._save_record(rec)
             # ttyd serves the terminal where it exists; the built-in console
             # websocket stays as the fallback (and as ttyd's own transport).
             from . import ttyd
-            await asyncio.to_thread(ttyd.start_for, vm_id, C.RUNTIME_PORT)
+            await asyncio.to_thread(ttyd.start_for, rec.id, C.RUNTIME_PORT)
         except Exception as exc:
             rec.state = "error"
             rec.error = str(exc)
@@ -349,7 +364,6 @@ class Manager:
                     await rec.vm.stop(graceful=False)
             # The slot stays with the errored record until it is deleted:
             # destroy() frees it, exactly once.
-        return rec
 
     async def _prepare_golden(self, rec: Record) -> None:
         """Bake the shared golden image once, then boot a clone of it.
