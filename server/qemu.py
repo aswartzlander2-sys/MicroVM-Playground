@@ -138,6 +138,10 @@ class QemuVM:
         self._connected = asyncio.Event()
         self._qmp_ready = asyncio.Event()
         self._qmp_pending = {}
+        # QEMU's own stderr, captured line-wise. A QEMU that dies during boot
+        # would otherwise fail opaquely after a long wait -- this buffer is
+        # what turns that into a concrete reason on the machine card.
+        self._stderr_buf: list[str] = []
 
     # ------------------------------------------------------------------ start
     async def start(self) -> None:
@@ -197,12 +201,34 @@ class QemuVM:
             # Generous deadline: under heavy host load (other guests, image
             # work, backups) a healthy QEMU can take a while before it dials
             # the serial socket; 30s turned a slow boot into a hard failure.
-            await asyncio.wait_for(self._connected.wait(), timeout=90)
-        except asyncio.TimeoutError:
+            #
+            # But a QEMU that loses the race at startup dies within seconds,
+            # and naively waiting the whole deadline then turns a 2-second
+            # fatal into a 90-second blank. So the wait doubles as a watchdog:
+            # process gone -> raise with QEMU's actual stderr right away.
+            deadline = loop.time() + 90
+            while True:
+                if self._connected.is_set():
+                    break
+                if self.proc is not None and self.proc.poll() is not None:
+                    tail = self.stderr_tail()
+                    raise QemuError(
+                        "QEMU exited during boot (code %s)%s"
+                        % (self.proc.returncode,
+                           ": " + tail if tail else " with no error output")
+                    )
+                if loop.time() >= deadline:
+                    raise QemuError(
+                        "QEMU never connected its serial console (90s). "
+                        "Check disk space, /dev/kvm availability and host load, "
+                        "then delete and recreate the machine."
+                    )
+                await asyncio.sleep(0.25)
+        except Exception:
             # don't leave it running: it holds the disk's write lock and the SSH port
             with contextlib.suppress(Exception):
                 await self._halt(graceful=False)
-            raise QemuError("QEMU never connected its serial console (90s). Check disk space, /dev/kvm availability and host load, then delete and recreate the machine.")
+            raise
 
         # SLIRP hands out a fixed layout; no DHCP snooping required.
         self.ip, self.gateway = "10.0.2.15", "10.0.2.2"
@@ -338,18 +364,21 @@ class QemuVM:
         """QEMU's own diagnostics -- surfaced on the console if it dies early."""
         if self.proc is None or self.proc.stdout is None:
             return
-        buf = []
         while True:
             line = await asyncio.to_thread(self.proc.stdout.readline)
             if not line:
                 break
-            buf.append(line.decode("utf-8", "replace").rstrip())
-            if len(buf) > 40:
-                buf.pop(0)
-        if self.proc.poll() not in (0, None) and buf:
+            self._stderr_buf.append(line.decode("utf-8", "replace").rstrip())
+            if len(self._stderr_buf) > 40:
+                self._stderr_buf.pop(0)
+        if self.proc.poll() not in (0, None) and self._stderr_buf:
             msg = "\r\n\x1b[91mQEMU exited (%s):\x1b[0m\r\n" % self.proc.returncode
-            self.console.publish(msg.encode() + "\r\n".join(buf).encode() + b"\r\n")
+            self.console.publish(msg.encode() + "\r\n".join(self._stderr_buf).encode() + b"\r\n")
             self.console.close()
+
+    def stderr_tail(self) -> str:
+        """The last captured QEMU stderr lines, for error messages and logs."""
+        return " | ".join(self._stderr_buf[-6:])
 
     # ------------------------------------------------------------------- I/O
     def write(self, data: bytes) -> None:
