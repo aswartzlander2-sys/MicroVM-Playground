@@ -75,8 +75,13 @@ let quietUntil=0;
 function quiet(ms){quietUntil=Date.now()+ms}
 function rawSend(data){if(socket&&socket.readyState===1)socket.send(new TextEncoder().encode(data))}
 const FONTS=[10,11,12,13,14,16,18,21];const fontSize={n:3};fontSize.get=()=>FONTS[fontSize.n];
-$('#consolecopy').onclick=()=>{if(!term)return;navigator.clipboard?.writeText(term.getSelection()||'').then(()=>toast('Copied selection')).catch(()=>toast('Copy failed — select text first'))};
-$('#consolepaste').onclick=()=>{navigator.clipboard?.readText().then(t=>{if(t){quiet(280);rawSend(t.replace(/\r?\n/g,'\r'))}term&&term.focus()}).catch(()=>toast('Clipboard is blocked — use Ctrl+Shift+V'))};
+$('#consolecopy').onclick=()=>{(function(){let txt=term&&term.getSelection?term.getSelection():'';if(!txt){toast('Select text first');return}
+  const legacy=()=>{let ta=document.createElement('textarea');ta.value=txt;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();let ok=false;try{ok=document.execCommand('copy')}catch(e){}ta.remove();toast(ok?'Copied':'Copy blocked — plain-HTTP pages cannot use the Clipboard; add HTTPS')};
+  if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(txt).then(()=>toast('Copied')).catch(legacy);
+  else legacy()})()};
+$('#consolepaste').onclick=()=>{const send=t=>{if(t){quiet(280);rawSend(t.replace(/\r?\n/g,'\r'))}term&&term.focus()};
+  if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.readText().then(send).catch(()=>{toast('Clipboard blocked — paste into the box instead');term&&term.focus()});
+  else{let t=prompt('Plain-HTTP pages block the Clipboard API. Paste into this box (hint: switch to HTTPS or localhost for one-click):');t&&send(t)}};
 function setFontSize(delta){let n=Math.min(FONTS.length-1,Math.max(0,fontSize.n+delta));if(n===fontSize.n)return;fontSize.n=n;if(term){term.options.fontSize=FONTS[n];refitConsole()}}
 $('#fontup').onclick=()=>setFontSize(1);
 $('#fontdown').onclick=()=>setFontSize(-1);

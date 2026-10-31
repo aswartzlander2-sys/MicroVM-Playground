@@ -127,6 +127,36 @@ async def doh_answers(name):
     except Exception:
         return []
 
+def _ensure_cloudflared():
+    """Best-effort install of cloudflared when the host lacks it.
+
+    Order: existing binary on PATH, the user-local xdg binary, then a one-time
+    download from Cloudflare's GitHub releases into ~/.local/bin. Nothing on
+    the system is overwritten; if every attempt fails the publish errors and
+    the reason lands on the request.
+    """
+    found=shutil.which('cloudflared')
+    if found: return found
+    local=Path.home()/'.local'/ 'bin' / 'cloudflared'
+    if local.exists() and os.access(local,os.X_OK): return str(local)
+    machine={'x86_64':'amd64','aarch64':'arm64','armv7l':'arm','armv6':'arm'}.get(
+        os.uname().machine,'amd64')
+    url='https://github.com/cloudflare/cloudflared/releases/latest/download/'\
+        'cloudflared-linux-%s'%machine
+    try:
+        local.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+        with httpx.stream('GET',url,timeout=180,follow_redirects=True) as resp:
+            resp.raise_for_status()
+            tmp=local.with_suffix('.part')
+            with open(tmp,'wb') as f:
+                for chunk in resp.iter_bytes(1<<16): f.write(chunk)
+        os.chmod(tmp,0o755)
+        os.replace(tmp,local)
+        return str(local)
+    except Exception:
+        with contextlib.suppress(OSError): (local.parent / 'cloudflared.part').unlink()
+        return None
+
 async def _wild_answers(zone):
     """Answers a WILDCARD/resolver would give for any name in this zone.
 
@@ -193,7 +223,9 @@ async def create(rec,guest_port,sub,access,zone_id=None):
     if access!='public': raise PublishError('Private access is not implemented; no route was published.')
     if rec.state!='running' or not hasattr(rec.vm,'host_forward'): raise PublishError('A running QEMU machine is required.')
     binary=shutil.which('cloudflared')
-    if not binary: raise PublishError('cloudflared is not installed. Install it on the host, then restart Robo Universal.')
+    if not binary:
+        binary=_ensure_cloudflared()
+        if not binary: raise PublishError('cloudflared could not be installed automatically. Put it on PATH and retry.')
     if not sys.platform.startswith('linux'): raise PublishError('Direct publishing currently requires Linux.')
     async with lock:
         if rec.state!='running': raise PublishError('The machine is no longer running.')
