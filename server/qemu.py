@@ -79,7 +79,11 @@ def detect_accelerator(qemu_bin: str) -> str:
                 if b"rror" in stdout or b"ailed" in stdout or p.returncode not in (0, None):
                     continue
             except subprocess.TimeoutExpired:
-                p.kill()          # still running == accelerator came up fine
+                p.kill()
+                # Reap the probe: kill() alone leaves a zombie under this
+                # process, one per accelerator check, for the whole run.
+                with contextlib.suppress(Exception):
+                    p.communicate(timeout=10)
                 _accel_cache = cand
                 return cand
         except Exception:
