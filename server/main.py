@@ -19,6 +19,7 @@ from . import catalog
 from .models import CreateVM, RenameVM
 from .auth import AuthMiddleware
 from . import files, publish
+from . import updates
 
 manager = Manager()
 
@@ -158,6 +159,25 @@ async def publishing_remove(vm_id: str, port: int):
     try: await publish.remove(vm_id,port,manager); return {"ok":True}
     except publish.PublishError as exc: raise HTTPException(status_code=400, detail=str(exc))
 
+@app.get("/api/updates")
+async def updates_status():
+    """Dashboard update state: what runs here vs what GitHub offers."""
+    return await updates.status()
+
+
+@app.post("/api/updates/apply")
+async def updates_apply():
+    """Fast-forward to GitHub's main and relaunch this server on the new code."""
+    try:
+        changed = await updates.apply()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    helper = None
+    if changed:
+        helper = await updates.self_restart()
+    return {"updated": changed, "restarting": bool(helper)}
+
+
 @app.post("/api/vms/{vm_id}/files")
 async def guest_files(vm_id: str, request: Request):
     rec = manager.get(vm_id)
@@ -259,6 +279,21 @@ async def stop_vm(vm_id: str):
 @app.post("/api/vms/{vm_id}/start")
 async def start_vm(vm_id: str):
     rec = await manager.resume(vm_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="no such playground")
+    if rec.state == "error":
+        return JSONResponse(status_code=500,
+                            content=json.loads(rec.view().model_dump_json()))
+    return rec.view()
+
+
+@app.post("/api/vms/{vm_id}/restart")
+async def restart_vm(vm_id: str):
+    """Graceful reboot with the same disk: suspend, then boot it again."""
+    try:
+        rec = await manager.restart(vm_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     if rec is None:
         raise HTTPException(status_code=404, detail="no such playground")
     if rec.state == "error":

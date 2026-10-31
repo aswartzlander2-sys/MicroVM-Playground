@@ -18,9 +18,11 @@ from . import catalog
 from .models import TTL_CHOICES, CreateVM, HostInfo, VMView
 
 ADJECTIVES = ["brisk", "amber", "quiet", "lucid", "nimble", "vivid", "candid",
-              "stellar", "arctic", "ember", "cobalt", "swift"]
+              "stellar", "arctic", "ember", "cobalt", "swift", "solar", "jade",
+              "mellow", "crisp", "peppy", "sunny", "onyx", "lunar"]
 NOUNS = ["otter", "falcon", "cinder", "harbor", "quartz", "vector", "lantern",
-         "meadow", "cipher", "pylon", "beacon", "mantis"]
+         "meadow", "cipher", "pylon", "beacon", "willow", "canyon", "summit",
+         "aurora", "cascade", "fjord", "grove", "iris", "summit"]
 
 
 def _friendly_name() -> str:
@@ -538,6 +540,35 @@ class Manager:
             await rec.vm.suspend()
             rec.state = "stopped"
             self._save_record(rec)
+        except Exception as exc:
+            rec.state = "error"
+            rec.error = str(exc)
+        return rec
+
+    async def restart(self, vm_id: str) -> Optional[Record]:
+        """Graceful reboot on the same disk; the machine comes back running.
+
+        Unlike suspend, a restart keeps every auto-destroy deadline as it is:
+        the machine shuts down and immediately boots again, so a TTL neither
+        outlives nor loses anything.
+        """
+        rec = self._vms.get(vm_id)
+        if rec is None or rec.vm is None:
+            return None
+        if rec.state != "running":
+            return rec
+        rec.state = "stopping"
+        from . import publish
+        await publish.close_vm(self, vm_id)
+        from . import ttyd
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(ttyd.stop_for, vm_id)
+        try:
+            await rec.vm.suspend()
+            await rec.vm.resume()
+            rec.state = "running"
+            self._save_record(rec)
+            await asyncio.to_thread(ttyd.start_for, vm_id, C.RUNTIME_PORT)
         except Exception as exc:
             rec.state = "error"
             rec.error = str(exc)

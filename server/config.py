@@ -81,7 +81,10 @@ RUNTIME_HOST = os.environ.get("MVMP_HOST", "127.0.0.1")
 # Codespaces forwards ports from inside the container, so bind all interfaces
 # there. The forwarded port is private to the user unless they publish it.
 IN_CODESPACE = os.environ.get("CODESPACES", "").lower() == "true"
-BIND_HOST = os.environ.get("MVMP_HOST", "0.0.0.0" if IN_CODESPACE else "127.0.0.1")
+# LAN-exposed by default: this dashboard is password-gated, and "a machine
+# dashboard nobody on my network can open" defeats the point. Codespaces
+# keeps 0.0.0.0 too. Pass MVMP_HOST=127.0.0.1 (or --host) to restrict it.
+BIND_HOST = os.environ.get("MVMP_HOST", "0.0.0.0")
 BIND_PORT = int(os.environ.get("MVMP_PORT", "64732"))
 
 # --- networking (firecracker only; qemu uses user-mode SLIRP) ----------------
