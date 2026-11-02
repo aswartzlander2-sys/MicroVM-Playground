@@ -144,6 +144,7 @@ class Record:
 
 class Manager:
     def __init__(self, backend: Optional[str] = None):
+        register(self)
         self.backend = backend or resolve_backend()
         self.mock = self.backend == "mock"
         self._vms: dict[str, Record] = {}
@@ -682,3 +683,18 @@ class Manager:
         if self.backend == "container":
             from .container import pool
             await pool().drain()         # do not leak the warm pool
+
+
+# --- cross-module lookup -------------------------------------------------------
+# gateway.py (the broker) and publish.py need machine records without importing
+# main.py (circular). Every live Manager registers itself here.
+_LIVE: list = []
+
+def register(m) -> None:
+    if m not in _LIVE: _LIVE.append(m)
+
+def lookup(vm_id: str):
+    for m in _LIVE:
+        rec = m.get(vm_id)
+        if rec is not None: return rec
+    return None

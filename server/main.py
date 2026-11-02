@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as C
 from . import ttyd
+from . import vpslink
 from .manager import Manager
 from . import catalog
 from .models import CreateVM, RenameVM
@@ -149,10 +150,64 @@ async def publishing_create(vm_id: str, request: Request):
     try:
         port = data.get("port")
         if type(port) is not int: raise publish.PublishError("Port must be a number")
+        gate = str(data.get("gate") or "")
+        if gate:   # wildcard-gateway publish: no per-port DNS, instant routes
+            return await publish.gate_publish(rec, port, str(data.get("sub", "")),
+                                              data.get("zone_id") or None, gate)
         return await publish.create(rec, port, str(data.get("sub", "")), str(data.get("access", "login")),
                                     data.get("zone_id") or None)
     except publish.PublishError as exc: raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc: raise HTTPException(status_code=502, detail="Port setup failed: " + str(exc)[:300])
+
+
+@app.get("/api/cloudflare/gates")
+async def cf_gates():
+    return await publish.gates_state()
+
+@app.get("/api/cloudflare/vps-links")
+async def cf_vps_links():
+    """VPS relay links for the Domains page (no secrets beyond the host)."""
+    return {"links": vpslink.view()}
+
+@app.post("/api/cloudflare/vps-links")
+async def cf_vps_link_draft(request: Request):
+    """Register a link draft; the Domains page prints the one command to run."""
+    import shlex as _shlex
+    data = await request.json()
+    try:
+        row = vpslink.new_draft(data.get("host", ""), data.get("user", "root"),
+                                data.get("ssh_port", 22), data.get("zones") or [])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    cmd = vpslink.command_hint(row, data.get("zone_name"), data.get("gate"))
+    return {"link": row, "command": cmd}
+
+@app.delete("/api/cloudflare/vps-links/{link_id}")
+async def cf_vps_link_drop(link_id: str):
+    vpslink.remove(link_id)
+    return {"ok": True}
+
+@app.post("/api/cloudflare/gates")
+async def cf_gate_create(request: Request):
+    data = await request.json()
+    try: return await publish.ensure_gate(data.get("zone_id", ""), str(data.get("gate", "")))
+    except publish.PublishError as exc: raise HTTPException(status_code=400, detail=str(exc))
+
+@app.delete("/api/cloudflare/gates/{gate_id}")
+async def cf_gate_delete(gate_id: str):
+    try:
+        await publish.remove_gate(gate_id)
+        return {"ok": True}
+    except publish.PublishError as exc: raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/api/cloudflare/zones-config")
+async def cf_zones_config(request: Request):
+    data = await request.json()
+    try:
+        gates = {str(k): list(v or []) for k, v in (data.get("gates") or {}).items()}
+        defaults = {str(k): str(v or "") for k, v in (data.get("defaults") or {}).items()}
+        return await publish.zones_update(data.get("default_zone_id", ""), gates, defaults)
+    except publish.PublishError as exc: raise HTTPException(status_code=400, detail=str(exc))
 
 @app.delete("/api/vms/{vm_id}/ports/{port}")
 async def publishing_remove(vm_id: str, port: int):

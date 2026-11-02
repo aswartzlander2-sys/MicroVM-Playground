@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Robo Universal – VPS relay link tool.
+
+Run ON the dashboard host:
+
+    .venv/bin/python tools/robo-vps-link link <vps-host> [--user root] [--port 22]
+                                            [--zone example.com] [--gate mygate]
+                                            [--install-caddy]
+
+One command stands the relay up: SSH goes out from this host to the VPS
+(key auth only, no passwords are ever handled here), one DNS record is
+created, Caddy gets an additive route via its local admin API, and an
+`ssh -N -R` tunnel carries the gate's broker port back to the VPS.
+Everything it touches is named after the link id, so `tools/robo-vps-link
+disconnect <id>` takes it all apart again cleanly.
+"""
+import argparse
+import contextlib
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = Path(os.environ.get('MVMP_STATE_DIR',
+                            str(Path.home() / '.local/state/mvmp')))
+LINKS = STATE / 'robo-vps-links.json'
+CF = STATE / 'robo-cloudflare.json'
+ADMIN = CADDY_ADMIN = 'http://127.0.0.1:2019'
+RELAY_BASE = 57100
+
+
+def sh(args, timeout=120):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+
+
+def ssh_cmd(host, user, port):
+    return ['ssh', '-p', str(port), '-o', 'BatchMode=yes', '-o',
+            'ConnectTimeout=12', '-o', 'StrictHostKeyChecking=accept-new',
+            '%s@%s' % (user, host)]
+
+
+def run_vps(host, user, port, script, timeout=90):
+    return sh(ssh_cmd(host, user, port) + [script], timeout)
+
+
+def load_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def save_links(rows):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = LINKS.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(rows, indent=1))
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(LINKS)
+
+
+def note(row, text, save=True):
+    row['note'] = text
+    row['updated'] = int(time.time())
+    if save:
+        rows = load_json(LINKS, [])
+        for i, r in enumerate(rows):
+            if r.get('id') == row['id']:
+                rows[i] = row
+        save_links(rows)
+
+
+def cf_api(method, path, payload=None, params=None):
+    cfg = load_json(CF, {})
+    token = cfg.get('token')
+    if not token:
+        raise SystemExit('Connect Cloudflare in the dashboard first (no token found).')
+    url = 'https://api.cloudflare.com/client/v4' + path
+    if params:
+        from urllib.parse import urlencode
+        url += '?' + urlencode(params)
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={'Authorization': 'Bearer ' + token,
+                 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        body = json.loads(resp.read().decode())
+    if not body.get('success'):
+        raise SystemExit('Cloudflare: ' + '; '.join(
+            (e.get('message') or '?') for e in body.get('errors', [])[:2]))
+    return body.get('result')
+
+
+def public_ip_of(host):
+    infos = socket.getaddrinfo(host, 0, proto=socket.IPPROTO_TCP)
+    for fam, _typ, _proto, _canon, sockaddr in infos:
+        ip = sockaddr[0]
+        if ip.count('.') == 3 and not ip.startswith('127.'):
+            return ip
+    raise SystemExit('"%s" resolves to %s — that is not a routable public '
+                     'IPv4 for a relay.' % (host, infos[0][4][0]))
+
+
+def relay_port(link_id):
+    return RELAY_BASE + (int(link_id, 36) % 899)
+
+
+def pick_broker(zone_id):
+    gates = load_json(STATE / 'robo-gateways.json', [])
+    brokers = [int(g['broker_port']) for g in gates
+               if g.get('zone_id') == zone_id and g.get('phase') in ('active', 'pending')]
+    if not brokers:
+        raise SystemExit('No gateway exists for that zone yet. Add one on the '
+                         'Domains page (the catch-all counts), then rerun.')
+    return brokers[0]
+
+
+def ensure_dns(zone, gate, ip):
+    wild = '*.' + zone if gate == '' else '*.%s.%s' % (gate, zone)
+    zid = zone_ids()[zone]
+    existing = cf_api('GET', '/zones/%s/dns_records' % zid,
+                      params={'name': wild, 'per_page': 25}) or []
+    if existing:
+        rec = next((r for r in existing if r['type'] == 'A' and
+                    r['content'].rstrip('.') == ip), None)
+        if rec:
+            return rec
+        foreign = existing[0]['content'][:60]
+        raise SystemExit('%s already points elsewhere (%s...): refusing to '
+                         'take it over.' % (wild, foreign))
+    return cf_api('POST', '/zones/%s/dns_records' % zid,
+                  {'type': 'A', 'name': wild, 'content': ip,
+                   'proxied': True, 'ttl': 1})
+
+
+def zone_ids():
+    cfg = load_json(CF, {})
+    return {z['name']: z['id'] for z in (cfg.get('zones') or [])}
+
+
+def caddy_installed(host, user, port):
+    r = run_vps(host, user, port,
+                'curl -s --max-time 3 %s/config/ > /dev/null 2>&1 && echo ADMINOK '
+                '|| (command -v caddy >/dev/null && echo BINONLY || echo NO)' % ADMIN,
+                timeout=40)
+    out = (r.stdout or '').strip()
+    return 'ADMINOK' if 'ADMINOK' in out else ('BINONLY' if 'BINONLY' in out else None)
+
+
+def push_route(host, user, port, link_id, gate, zone, relay):
+    fqdn = ('%s.%s' % (gate, zone)) if gate else zone
+    route = {'id': 'robo-link-%s' % link_id,
+             'match': [{'host': [fqdn] + (['*.' + fqdn] if gate else [])}],
+             'handle': [{'handler': 'reverse_proxy',
+                         'upstreams': [{'dial': '127.0.0.1:%d' % relay}]}]}
+    payload = json.dumps({'apps': {'http': {'routes': [route]}}})
+    quoted = shlex.quote(payload)
+    r = run_vps(host, user, port,
+                'curl -s -X POST %s/config/apps/http/ -H '
+                '"Content-Type: application/json" -d %s && echo' % (ADMIN, quoted),
+                timeout=40)
+    out = (r.stdout or r.stderr or '').strip()
+    if '"error"' in out.lower() and 'usage already exists' not in out.lower():
+        raise SystemExit('Caddy admin push failed: %s' % out[:220])
+
+
+def start_tunnel(host, user, port, link_id, broker):
+    relay = relay_port(link_id)
+    unit = 'robo-relay-%s.service' % link_id
+    ud = Path.home() / '.config/systemd/user'
+    ud.mkdir(parents=True, exist_ok=True)
+    bin = sh(['which', 'ssh']).stdout.strip() or '/usr/bin/ssh'
+    unit_text = (
+        '[Unit]\nDescription=Robo relay tunnel to %s (link %s)\n'
+        '[Service]\nExecStart=%s -N -R 127.0.0.1:%d:127.0.0.1:%d -p %d '
+        '-o ExitOnForwardFailure=yes -o ServerAliveInterval=25 -o '
+        'ServerAliveCountMax=4 -o BatchMode=yes %s@%s\n'
+        'Restart=always\nRestartSec=5\n' % (host, link_id, bin, relay, broker,
+                                            port, user, host))
+    (ud / unit).write_text(unit_text)
+    sh(['systemctl', '--user', 'daemon-reload'])
+    r = sh(['systemctl', '--user', 'enable', '--now', unit])
+    if r.returncode != 0:
+        raise SystemExit('systemd --user unit failed: %s' % (r.stderr or '')[:200])
+    return relay, unit
+
+
+def verify_https(name, timeout=25):
+    try:
+        req = urllib.request.Request('https://%s/' % name,
+                                     headers={'User-Agent': 'robo-link-verify'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, dict(resp.headers)
+    except Exception as exc:
+        return None, {'error': str(exc)[:200]}
+
+
+def cmd_link(args):
+    host = args.host.lstrip()
+    user = args.user or 'root'
+    port = args.port or 22
+    zones = [args.zone] if args.zone else []
+    gates = [args.gate] if args.gate else []
+    rows = load_json(LINKS, [])
+    row = next((r for r in rows if r.get('host') == host and r.get('user') == user
+                and r.get('phase') in ('draft', 'active')), None)
+    if row is None:
+        row = {'id': ('%x' % int(time.time() * 1000))[-11:], 'host': host,
+               'user': user, 'ssh_port': port, 'zones': zones, 'gates': gates,
+               'phase': 'draft', 'created': int(time.time()), 'token': '', 'note': ''}
+        rows.append(row)
+        save_links(rows)
+    row['zones'] = sorted(set((row.get('zones') or []) + zones))
+    if args.gate and args.gate not in (row.get('gates') or []):
+        row['gates'] = (row.get('gates') or []) + [args.gate]
+    note(row, 'probed' if args.zone else 'draft (no zone given)')
+
+    ok = run_vps(host, user, port, 'echo LINKOK', timeout=30)
+    if 'LINKOK' not in (ok.stdout or ''):
+        why = (ok.stderr or ok.stdout or 'no output').strip().splitlines()[-1:]
+        row['phase'] = 'failed'
+        note(row, 'ssh key login failed (%s)' % why, save=True)
+        raise SystemExit('ssh -p %d %s@%s refused: %s\nAdd your key with: '
+                         'ssh-keygen -t ed25519 (once), then '
+                         'ssh-copy-id %s@%s' % (port, user, host, why, user, host))
+
+    if not zones:
+        print('SSH key works. Re-run with --zone <domain> --gate <gate-name> to '
+              'stand the relay up (a gate subdomain is required: the relay '
+              'carries *.{gate}.{zone} TLS that Cloudflare free certs do not).')
+    else:
+        if not args.gate:
+            raise SystemExit('A --gate <gate-name> is required for a VPS link: '
+                             'the relay terminates TLS for *.{gate}.{zone}. '
+                             'The plain catch-all (*.zone) stays on the free '
+                             'tunnel and needs no VPS.')
+        cmd_wire_done(row, host, user, port, args.zone, args.gate,
+                      args.install_caddy)
+
+
+def cmd_wire_done(row, host, user, port, zone, gate, install_caddy):
+    row['phase'] = 'linking'; note(row, 'checking caddy relay')
+    ip = public_ip_of(host)
+    state = caddy_installed(host, user, port)
+    if state is None:
+        if not install_caddy:
+            raise SystemExit('Caddy is not on the VPS. Approve an onward install '
+                             'with --install-caddy (standard apt package), or '
+                             'install Caddy there yourself.')
+        r = run_vps(host, user, port,
+                    'DEBIAN_FRONTEND=noninteractive apt-get install -y caddy',
+                    timeout=420)
+        if r.returncode != 0:
+            raise SystemExit('apt install caddy failed: %s' % (r.stderr or r.stdout)[:220])
+        note(row, 'caddy installed')
+    if state == 'BINONLY':
+        # Caddy exists but the admin API is off; simplest additive fix: a
+        # drop-in that turns the admin API on for the ROBO link only.
+        raise SystemExit('Caddy is installed but its admin API (:2019) is off. '
+                         'Enable `admin { listen localhost:2019 }` in its '
+                         'Caddyfile, then rerun this command.')
+    relay = relay_port(row['id'])
+    push_route(host, user, port, row['id'], gate, zone, relay)
+    note(row, 'caddy route robo-link-%s pushed' % row['id'])
+    dns = ensure_dns(zone, gate, ip)
+    note(row, 'dns %s -> %s' % (('*.' + zone) if gate == '' or not gate else
+                                ('*.%s.%s' % (gate, zone)), ip))
+    rec_id = dns['id'] if isinstance(dns, dict) else None
+    broker = pick_broker(zone_ids()[zone])
+    relay, unit = start_tunnel(host, user, port, row['id'], broker)
+    # machine traffic flows: the tunnel carries 127.0.0.1:<broker> to the VPS;
+    # caddy on the VPS terminates TLS and proxies into the broker.
+    # Wait for TLS/Let's Encrypt; verify through the relayed broker with one
+    # gate-owned label that is deliberately unpublished: the broker answers
+    # its friendly page, so a Robo-Gateway-Status header proves the whole
+    # chain (DNS → Caddy TLS → tunnel → broker) works without needing a VM.
+    label = 'robo-link-check'
+    wildcard = ('*.' + zone) if not gate else ('*.' + gate + '.' + zone)
+    fqdn = (label + '.' + zone) if not gate else ('%s.%s.%s' % (label, gate, zone))
+    ok502 = None
+    for attempt in range(12):
+        st, hdr = verify_https(fqdn, timeout=20)
+        if st is not None and 'robo-gateway-status' in {k.lower() for k in hdr}:
+            ok502 = st
+            break
+        time.sleep(10)
+    if ok502 is not None:
+        row['phase'] = 'active'
+        note(row, 'relay live and answering TLS for %s' % wildcard)
+        print('Linked: %s rides the relay (dashboard broker %d ↔ VPS %d, '
+              'unit %s). The Domains page can now publish gate-subdomain '
+              'addresses.' % (wildcard, broker, relay, unit))
+    else:
+        row['phase'] = 'linking'
+        raise SystemExit('Wired but TLS did not answer yet (%s). The route, DNS '
+                         'and tunnel stay in place; rerun this command in a few '
+                         'minutes to re-verify.' % (hdr.get('error') or
+                                                    ('status ' + str(st))))
+
+
+def cmd_disconnect(args):
+    rows = load_json(LINKS, [])
+    row = next((r for r in rows if r.get('id') == args.id), None)
+    if row is None:
+        raise SystemExit('No such link id.')
+    host = row.get('host'); user = row.get('user') or 'root'; port = row.get('ssh_port') or 22
+    zone = (row.get('zones') or [''])[0]
+    gate = (row.get('gates') or [''])[0]
+    # systemd user unit off
+    sh(['systemctl', '--user', 'disable', '--now',
+        'robo-relay-%s.service' % row['id']])
+    unit = Path.home() / '.config/systemd/user/robo-relay-%s.service' % row['id']
+    with contextlib.suppress(OSError):
+        unit.unlink()
+    sh(['systemctl', '--user', 'daemon-reload'])
+    # remove our exact caddy route object and the exact DNS record
+    if zone:
+        wild = ('*.' + zone) if not gate else ('*.' + gate + '.' + zone)
+        rec_id = (row.get('dns_rec') or {}).get(wild)
+        if rec_id:
+            try:
+                cf_api('DELETE', '/zones/%s/dns_records/%s' % (zone_ids()[zone], rec_id))
+            except SystemExit as e:
+                print('dns delete note:', e)
+        try:
+            run_vps(host, user, port,
+                    'curl -s -X DELETE %s/config/apps/http/routes/robo-link-%s && echo'
+                    % (ADMIN, row['id']), timeout=40)
+        except SystemExit as e:
+            print('caddy delete note:', e)
+    save_links([r for r in rows if r.get('id') != args.id])
+    print('Link %s torn down (unit, route object and %s record).' % (
+        args.id, ('*.%s.%s' % (gate, zone)) if gate else ('*.' + zone)))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest='cmd', required=True)
+    l = sub.add_parser('link', help='link a VPS relay (creates or wires)')
+    l.add_argument('host')
+    l.add_argument('--user', default='root')
+    l.add_argument('--port', type=int, default=22)
+    l.add_argument('--zone', help='domain to attach the relay to')
+    l.add_argument('--gate', default='', help='gate subdomain (blank = zone catch-all-style labels under *.zone on the VPS… usually leave blank; publish handles gates)')
+    l.add_argument('--install-caddy', action='store_true')
+    w = sub.add_parser('wire', help='re-run/finish wiring of a draft link')
+    w.add_argument('id')
+    d = sub.add_parser('disconnect', help='undo everything for one link')
+    d.add_argument('id')
+    p.add_argument('--list', action='store_true')
+    a = p.parse_args()
+    if not getattr(a, 'cmd', None):
+        for r in load_json(LINKS, []):
+            print(r['id'], r.get('phase'), '%s@%s' % (r.get('user'), r.get('host')),
+                  'zones=%s' % ','.join(r.get('zones') or []), r.get('note') or '')
+        return
+    if a.cmd == 'wire':
+        rows = load_json(LINKS, [])
+        row = next((r for r in rows if r['id'] == a.id), None)
+        if row is None:
+            raise SystemExit('No draft link %s. Run tools/robo-vps-link link '
+                             '<host> --zone <domain> first.' % a.id)
+        zone = (row.get('zones') or [None])[0]
+        if not zone:
+            raise SystemExit('That draft has no zone. Re-link with --zone.')
+        cmd_wire_done(row, row['host'], row.get('user') or 'root',
+                      row.get('ssh_port') or 22, zone, (row.get('gates') or [''])[0],
+                      a.install_caddy if hasattr(a, 'install_caddy') else False)
+    elif a.cmd == 'disconnect':
+        cmd_disconnect(a)
+    else:
+        cmd_link(a)
+
+if __name__ == '__main__':
+    main()

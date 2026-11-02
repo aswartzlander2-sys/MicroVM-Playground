@@ -7,6 +7,7 @@ import asyncio, contextlib, json, os, re, shutil, socket, sys, tempfile, time, u
 from pathlib import Path
 import httpx
 from . import config as C
+from . import gateway
 
 STATE=C.STATE_DIR/'robo-direct-published.json'
 CONFIG=C.STATE_DIR/'robo-cloudflare.json'
@@ -316,13 +317,18 @@ async def cleanup(row,rec=None):
         await api('DELETE',base,allow_missing=True)
     save([r for r in load() if r.get('id')!=row.get('id')])
 
-async def remove(vm,guest_port,manager):
+async def close_vm(manager, vm_id):
+    """All routes for one VM are torn down (machine delete/shutdown)."""
     async with lock:
-        rows=load()
-        row=next((r for r in rows if r['vm']==vm and r['guest_port']==guest_port),None)
-        if not row: raise PublishError('Published port not found.')
-        row['phase']='cleanup';save(rows)
-        await cleanup(row,manager.get(vm))
+        for row in load():
+            if row.get('vm') != vm_id: continue
+            try: await cleanup(row,manager.get(vm_id))
+            except Exception: pass  # connector stopped, journal kept for retry
+        # Gate mappings only hold a wildcard-route entry: dropping the mapping
+        # is enough; the shared tunnel + DNS record stay for the rest.
+        maps=gateway.load_maps()
+        keep=[m for m in maps if m.get('vm')!=vm_id]
+        if len(keep)!=len(maps): gateway.save_maps(keep)
 
 async def reconcile(manager):
     async with lock:
@@ -332,6 +338,7 @@ async def reconcile(manager):
             if not rec or rec.state!='running' or row.get('phase')!='active' or not proc or proc.returncode is not None:
                 try: await cleanup(row,rec)
                 except Exception: pass # retain journal for retry; never silently forget resources
+        await _reconcile_gates()
 
 async def listing():
     rows=load();mutated=False;result=[]
@@ -350,11 +357,330 @@ async def listing():
             status='ready' if r.get('dns_checked') else 'provisioning'
         result.append({**r,'tunnel':{'url':'https://'+host,'domain':domain,'sub':sub,'status':status,'wildcard':bool(r.get('wildcard')),'access':r.get('access','public')}})
     if mutated: save(rows)
+    result.extend(await _gate_listing())
     return result
 
-async def close_vm(manager, vm_id):
+
+
+async def remove(vm,guest_port,manager):
+    """Unpublish a port. Tries the legacy direct route first, then gate maps."""
     async with lock:
-        for row in load():
-            if row.get('vm') != vm_id: continue
-            try: await cleanup(row,manager.get(vm_id))
-            except Exception: pass  # connector stopped, retained journal for retry
+        rows=load()
+        row=next((r for r in rows if r['vm']==vm and r['guest_port']==guest_port),None)
+        if row is not None:
+            row['phase']='cleanup';save(rows)
+            await cleanup(row,manager.get(vm))
+            return
+        await _gate_unpublish(vm,guest_port)
+
+
+# ─────────────────────────── wildcard gateways ───────────────────────────
+# ONE cloudflare tunnel + ONE wildcard record per (domain, root-subdomain).
+# Every published port rides that wildcard as a label (github-codespace
+# style): {label}.{gate}.{zone} -> cloudflared -> local broker -> guest port.
+# Publishing becomes instant (no per-port DNS records); the address stays
+# stable while the machine is down (the broker explains instead of raw 502).
+
+gate_processes={}   # gateway id -> cloudflared subprocess
+
+def _label_ok(text):
+    return bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',text))
+
+VPS_LINKS=C.STATE_DIR/'robo-vps-links.json'
+
+def _vps_linked(zone_id):
+    """True while a working VPS relay link covers this zone (the burrows
+    gate path, which terminates TLS off-Cloudflare)."""
+    from . import vpslink
+    return vpslink.linked(zone_id)
+
+def _host_under(zone, gate, sub):
+    return (sub + '.' + zone) if gate == '_' else (sub + '.' + gate + '.' + zone)
+
+def _display_domain(zone, gate):
+    return ('' if gate == '_' else gate + '.') + zone
+
+def _gate_binary():
+    binary=shutil.which('cloudflared') or _ensure_cloudflared()
+    if not binary: raise PublishError('cloudflared could not be installed automatically. Put it on PATH and retry.')
+    return binary
+
+def manager_rec(vm_id):
+    from . import manager
+    return manager.lookup(vm_id)
+
+async def gates_state():
+    """Setup info for the UI: every zone's configured gates + live status.
+
+    The catch-all ('_': labels directly under the domain) is always offered;
+    brand new publish names may exist nowhere yet -- the Domains page builds
+    them explicitly, and the ports modal builds them right before publishing.
+    """
+    c=read(CONFIG,{})
+    out=[]
+    for z in config_zones(c):
+        gates=[]
+        grows=gateway.load_gates()
+        for name in (z.get('gates') or []):
+            row=next((g for g in grows if g.get('zone_id')==z['id'] and g.get('gate')==name),None)
+            proc=gate_processes.get(row['id']) if row else None
+            gates.append({'name':name,'default':z.get('default_gate')==name,
+                          'id':row['id'] if row else None,
+                          'status':('unbuilt' if not row else
+                                    ('connected' if proc and proc.returncode is None else 'down'))})
+        if not any(g['name']=='_' for g in gates):
+            row=next((g for g in grows if g.get('zone_id')==z['id'] and g.get('gate')=='_'),None)
+            proc=gate_processes.get(row['id']) if row else None
+            gates.insert(0,{'name':'_','default':z.get('default_gate','') in ('',None),
+                            'id':row['id'] if row else None,
+                            'status':('unbuilt' if not row else
+                                      ('connected' if proc and proc.returncode is None else 'down'))})
+        out.append({**z,'gates':gates})
+    return {'zones':out,'connected':bool(c.get('token'))}
+
+async def zones_update(default_zone_id,gates_by_zone,default_gate_by_zone):
+    """Save per-domain defaults and gateway labels from the Domains tab.
+
+    Pure bookkeeping: nothing here touches DNS or tunnels. Creating or
+    deleting wildcard gateways is a separate explicit action.
+    """
+    async with lock:
+        c=cfg(); zones_all=config_zones(c)
+        for z in zones_all:
+            z['default']=z['id']==default_zone_id
+            z['default_gate']=str(default_gate_by_zone.get(z['id'],'') or '')
+            known=set(z.get('gates') or [])
+            z['gates']=sorted(known | {str(g) for g in gates_by_zone.get(z['id'],[]) if _label_ok(str(g))})
+        c['zones']=zones_all
+        write(CONFIG,c)
+        return await gates_state()
+
+async def ensure_gate(zone_id,gate):
+    """Idempotently stand up a wildcard gateway for a domain.
+
+    gate=='_' is the zone catch-all: one record *.{zone} -> tunnel, and every
+    published port becomes a label directly under the domain. Anything else
+    is a burrows gate ({label}.{gate}.{zone}) which Cloudflare's free cert
+    does not cover at the edge -- those need a linked VPS relay to terminate
+    TLS, so they are refused until one is linked.
+
+    Creates (or reuses) the shared cfd_tunnel, points ONE wildcard CNAME at
+    it, starts the local broker listener and the cloudflared connector. If all
+    of that already exists, this is a no-op -- a retry or a server restart
+    never duplicates DNS rows or tunnels.
+    """
+    gate=(gate or '').strip().lower()
+    catch_all = gate == '_'
+    if not catch_all and not _label_ok(gate): raise PublishError('Gateway name must be a single DNS label (letters, digits, dashes).')
+    async with lock:
+        c=cfg(); zones_all=config_zones(c)
+        zone=next((z for z in zones_all if z.get('id')==zone_id),None)
+        if zone is None: raise PublishError('That domain is not connected. Reconnect Cloudflare first.')
+        if not catch_all and not _vps_linked(zone['id']):
+            raise PublishError("A gate subdomain needs a linked VPS relay — Cloudflare's free edge certificate only covers one level (labels directly under the domain). Add a VPS on the VPS panel first, or use the zone catch-all.")
+        rows=gateway.load_gates()
+        g=next((x for x in rows if x.get('zone_id')==zone_id and x.get('gate')==gate),None)
+        if g and g.get('phase')=='active':
+            # Rebind the broker if this process has no listener yet (a server
+            # restart re-registers every gate only on the next reconcile tick
+            # otherwise -- the gate would 502/timeout until then).
+            await gateway.start_listeners()
+            return await _gate_view(g)
+        wildcard_fqdn=('*.'+zone['name']) if catch_all else ('*.'+gate+'.'+zone['name'])
+        tunnel_name=('robo-zone-%s-%s'%(zone['name'],uuid.uuid4().hex[:8]) if catch_all
+                     else 'robo-gate-%s-%s'%(gate,uuid.uuid4().hex[:8]))
+        try:
+            binary=_gate_binary()
+            if g is None:
+                g={'id':uuid.uuid4().hex,'zone_id':zone['id'],'zone':zone['name'],
+                   'gate':gate,'account_id':zone['account_id'],'phase':'pending'}
+                rows.append(g)
+            g['phase']='pending'
+            broker_port=g.get('broker_port') or allocate()
+            tunnel_id=g.get('tunnel_id')
+            if not tunnel_id:
+                tunnel=await api('POST',f"/accounts/{zone['account_id']}/cfd_tunnel",
+                                 {'name':tunnel_name,'config_src':'cloudflare'})
+                tunnel_id=tunnel['id']
+                await api('PUT',f"/accounts/{zone['account_id']}/cfd_tunnel/{tunnel_id}/configurations",
+                          {'config':{'ingress':[
+                              {'hostname':wildcard_fqdn,'service':'http://127.0.0.1:%d'%broker_port},
+                              {'service':'http_status:404'}]}})
+            g['tunnel_id']=tunnel_id;g['broker_port']=broker_port
+            gateway.save_gates(rows)
+            # The single DNS row the whole gateway needs. Reuse our own;
+            # never overwrite someone else's record, and for the catch-all
+            # make that crystal clear -- the zone's every name rides it.
+            record=next((r for r in await api('GET',f"/zones/{zone['id']}/dns_records",
+                        params={'name':wildcard_fqdn,'per_page':5}) or []),None)
+            if record and record.get('content','').rstrip('.')!=tunnel_id+'.cfargotunnel.com':
+                if catch_all:
+                    raise PublishError("'%s' already has a catch-all record pointing somewhere else (%s). Latitude: this domain's labels are served by another destination; removing that record would take it down."
+                                       %(wildcard_fqdn, record.get('type','record')))
+                raise PublishError("'%s' already has a different wildcard record; choose another gateway name or remove that record."%wildcard_fqdn)
+            if not record:
+                dns=await api('POST',f"/zones/{zone['id']}/dns_records",
+                              {'type':'CNAME','name':wildcard_fqdn,'content':tunnel_id+'.cfargotunnel.com','proxied':True,'ttl':1})
+                g['dns_id']=dns['id']
+            else:
+                g['dns_id']=record['id']
+            gateway.save_gates(rows)
+            proc=gate_processes.get(g['id'])
+            if not proc or proc.returncode is not None:
+                token=await api('GET',f"/accounts/{zone['account_id']}/cfd_tunnel/{tunnel_id}/token")
+                env=os.environ.copy();env['TUNNEL_TOKEN']=token
+                wrapper=str(Path(__file__).resolve().parent.parent/'tools'/'cloudflared_child.py')
+                proc=await asyncio.create_subprocess_exec(sys.executable,wrapper,binary,env=env,
+                                                          stdin=asyncio.subprocess.DEVNULL,
+                                                          stdout=asyncio.subprocess.DEVNULL,
+                                                          stderr=asyncio.subprocess.DEVNULL)
+                gate_processes[g['id']]=proc
+            await gateway.start_listeners()
+            g['phase']='active';gateway.save_gates(rows)
+            return await _gate_view(g)
+        except PublishError:
+            gateway.save_gates(rows)   # pending row kept: reconciliation retries
+            raise
+        except Exception as exc:
+            gateway.save_gates(rows)
+            raise PublishError(str(exc)[:220])
+
+async def _gate_view(g):
+    proc=gate_processes.get(g['id'])
+    return {'id':g['id'],'zone':g['zone'],'zone_id':g['zone_id'],'gate':g['gate'],
+            'wildcard':('*.'+g['zone']) if g['gate']=='_' else ('*.'+g['gate']+'.'+g['zone']),
+            'broker_port':g.get('broker_port'),
+            'status':('connected' if proc and proc.returncode is None else g.get('phase','pending'))}
+
+async def remove_gate(gate_id):
+    """Tear down one gateway: its maps, wildcard record, tunnel, connector."""
+    async with lock:
+        rows=gateway.load_gates()
+        g=next((x for x in rows if x['id']==gate_id),None)
+        if g is None: raise PublishError('Gateway not found.')
+        g['phase']='removing';gateway.save_gates(rows)
+        zid,zname,gt=g['zone_id'],g['zone'],g['gate']
+        maps=gateway.load_maps()
+        gateway.save_maps([m for m in maps if not (m.get('zone_id')==zid and m.get('gate')==gt)])
+        try:
+            proc=gate_processes.pop(g['id'],None)
+            if proc and proc.returncode is None:
+                proc.terminate()
+                try: await asyncio.wait_for(proc.wait(),5)
+                except asyncio.TimeoutError: proc.kill(); await proc.wait()
+            tid=g.get('tunnel_id')
+            if tid:
+                wcard=('*.'+zname) if gt=='_' else ('*.'+gt+'.'+zname)
+                for record in await api('GET',f"/zones/{zid}/dns_records",params={'name':wcard,'per_page':5}) or []:
+                    if record.get('content','').rstrip('.')==tid+'.cfargotunnel.com':
+                        await api('DELETE',f"/zones/{zid}/dns_records/{record['id']}",allow_missing=True)
+                base=f"/accounts/{g['account_id']}/cfd_tunnel/{tid}"
+                await api('DELETE',base+'/connections',allow_missing=True)
+                await api('DELETE',base,allow_missing=True)
+        except Exception:
+            pass    # partial teardown; retrying remove_gate finishes the job
+        await gateway.stop_listener(gt,zname,zid)
+        fresh=[x for x in gateway.load_gates() if x['id']!=gate_id]
+        gateway.save_gates(fresh)
+        # Drop the label from the zone's configured list, and its default.
+        c=read(CONFIG,{})
+        for z in config_zones(c):
+            if z['id']==zid:
+                z['gates']=[x for x in (z.get('gates') or []) if x!=gt]
+                if z.get('default_gate')==gt: z['default_gate']=''
+        if c.get('zones'): write(CONFIG,c)
+
+async def gate_publish(rec,guest_port,sub,zone_id,gate_name):
+    """Publish one port through a wildcard gateway: zero per-port DNS rows."""
+    if not 1<=guest_port<=65535: raise PublishError('Port must be between 1 and 65535')
+    if rec.state!='running' or not hasattr(rec.vm,'host_forward'): raise PublishError('A running QEMU machine is required.')
+    async with lock:
+        c=cfg(); zones_all=config_zones(c)
+        zone=next((z for z in zones_all if z.get('id')==zone_id),None)
+        if zone is None: raise PublishError('Pick one of the connected domains.')
+        grow=gateway.load_gates()
+        g=next((x for x in grow if x.get('zone_id')==zone_id and x.get('gate')==gate_name and x.get('phase')=='active'),None)
+        if g is None: raise PublishError('Set up the wildcard gateway for this domain first (Domains tab).')
+        sub=(sub or '').strip().lower()
+        if not sub:
+            sub='%s-%d'%((rec.name or 'vm').lower().replace('_','-'),guest_port)
+        if not _label_ok(sub): raise PublishError('Publish name must be a single DNS label (letters, digits, dashes).')
+        host=_host_under(zone['name'], g['gate'], sub)
+        maps=gateway.load_maps()
+        kind=[m for m in maps if m['hostname']==host and m.get('phase','active')=='active']
+        if kind:
+            e=kind[0]
+            if e.get('vm')==rec.id and e.get('guest_port')==guest_port:
+                return _map_view(e,g)
+            raise PublishError("'%s' is already published by another service; pick another name."%host)
+        row={'id':uuid.uuid4().hex,'vm':rec.id,'guest_port':guest_port,
+             'host_port':allocate(),'sub':sub,'hostname':host,'zone':zone['name'],
+             'zone_id':zone['id'],'gate':g['gate'],'access':'public','phase':'active',
+             'created_at':time.time()}
+        maps.append(row);gateway.save_maps(maps)
+        try:
+            await rec.vm.host_forward(row['host_port'],guest_port)
+        except Exception as exc:
+            _save_maps_without(row)
+            raise PublishError('QEMU rejected the port forward: %s'%str(exc)[:180])
+        return _map_view(row,g)
+
+def _save_maps_without(row):
+    gateway.save_maps([m for m in gateway.load_maps() if m.get('id')!=row.get('id')])
+
+def _map_view(m,g):
+    return {'vm':m['vm'],'guest_port':m['guest_port'],'host_port':m['host_port'],
+            'gateway':g['gate'],
+            'tunnel':{'url':'https://'+m['hostname'],'domain':_display_domain(m['zone'],g['gate']),
+                      'sub':m['sub'],'access':'public','status':'ready','wildcard':True}}
+
+def _gate_unpublish(vm,guest_port):
+    """Remove gate maps (+ their forwards) for one guest port."""
+    maps=gateway.load_maps()
+    rows=[m for m in maps if m.get('vm')==vm and m.get('guest_port')==guest_port]
+    if not rows: raise PublishError('Published port not found.')
+
+    async def _drop():
+        rec=manager_rec(vm)
+        if rec is not None and hasattr(rec.vm,'host_forward'):
+            for row in rows:
+                with contextlib.suppress(Exception):
+                    await rec.vm.host_forward(row['host_port'],row['guest_port'],remove=True)
+        gateway.save_maps([m for m in maps if m not in rows])
+
+    return _drop()
+
+async def _reconcile_gates():
+    """Keep every gateway's connector and broker alive across restarts."""
+    for g in gateway.load_gates():
+        if g.get('phase') not in ('active','pending') or g.get('phase')=='removing': continue
+        proc=gate_processes.get(g['id'])
+        if not proc or proc.returncode is not None:
+            try:
+                binary=_gate_binary()
+                token=await api('GET',f"/accounts/{g['account_id']}/cfd_tunnel/{g['tunnel_id']}/token")
+                env=os.environ.copy();env['TUNNEL_TOKEN']=token
+                wrapper=str(Path(__file__).resolve().parent.parent/'tools'/'cloudflared_child.py')
+                proc=await asyncio.create_subprocess_exec(sys.executable,wrapper,binary,env=env,
+                                                          stdin=asyncio.subprocess.DEVNULL,
+                                                          stdout=asyncio.subprocess.DEVNULL,
+                                                          stderr=asyncio.subprocess.DEVNULL)
+                gate_processes[g['id']]=proc
+            except Exception: continue
+    await gateway.start_listeners()
+
+async def _gate_listing():
+    """Gate-mapped publishes, in the same shape the ports modal already reads."""
+    result=[]
+    for m in gateway.load_maps():
+        if m.get('phase','active')!='active': continue
+        rec=manager_rec(m['vm'])
+        up=bool(rec and rec.state=='running')
+        result.append({**m,'tunnel':{'url':'https://'+m['hostname'],
+            'domain':_display_domain(m['zone'],m['gate']),'sub':m['sub'],
+            'status':('ready' if up else 'connected-machine-down'),
+            'access':m.get('access','public'),'wildcard':True,'gateway':m['gate']}})
+    return result
+
+async def close_listeners():
+    await gateway.stop_listeners()

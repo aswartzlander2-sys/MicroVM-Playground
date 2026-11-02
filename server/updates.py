@@ -35,6 +35,7 @@ async def status():
     remote = None
     behind = 0
     error = None
+    log = []
     try:
         def fetch():
             _git("fetch", "-q", "origin", "main")
@@ -42,6 +43,15 @@ async def status():
         remote = await asyncio.to_thread(fetch)
         behind = int(await asyncio.to_thread(
             _git, "rev-list", "--count", "HEAD..origin/main"))
+        if behind:
+            raw = await asyncio.to_thread(
+                _git, "log", "--format=%h%x1f%s", "HEAD..origin/main",
+                "--max-count=10")
+            for line in raw.splitlines():
+                if not line.strip():
+                    continue
+                short, _, subject = line.partition("\x1f")
+                log.append({"short": short.strip(), "subject": subject.strip()})
     except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         error = str(exc)[:160]
     # .git only exists when the checkout is the repo (not a docker copy).
@@ -49,7 +59,8 @@ async def status():
     if (ROOT / ".git").exists():
         dirty = await asyncio.to_thread(_git, "status", "--porcelain")
     return {"available": behind > 0, "behind": behind, "current": info,
-            "remote_short": remote, "dirty": bool(dirty.strip()), "error": error}
+            "remote_short": remote, "dirty": bool(dirty.strip()), "error": error,
+            "log": log}
 
 
 async def apply():

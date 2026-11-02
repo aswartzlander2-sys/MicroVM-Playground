@@ -127,30 +127,66 @@ function openFiles(id){fileVM=id;selectedFile='';$('#filetitle').textContent=(vm
 async function fileRequest(action,path,content){let payload={action,path,username:$('#sshuser').value,password:$('#sshpass').value};if(content!==undefined)payload.content=content;let res=await fetch('/api/vms/'+encodeURIComponent(fileVM)+'/files',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok){let err=await res.json().catch(()=>({}));throw Error(err.detail||'File request failed')}return action==='download'?res.blob():res.json()}
 async function listFiles(path){$('#fileerror').textContent='';try{let data=await fileRequest('list',path);$('#filepath').value=data.path;$('#filelist').innerHTML=data.entries.length?data.entries.map((f,i)=>`<button class="fileentry" data-file-index="${i}"><span class="fi">${f.directory?'▸':'▤'}</span><span class="fn">${esc(f.name)}${f.symlink?' ↗':''}</span><span class="fm">${f.directory?'DIR':esc(f.size)+' B'}</span></button>`).join(''):'<p class="notice">This directory is empty.</p>';document.querySelectorAll('[data-file-index]').forEach(b=>b.onclick=()=>{let f=data.entries[Number(b.dataset.fileIndex)],p=(path==='/'?'':path.replace(/\/$/,''))+'/'+f.name;if(f.directory)listFiles(p);else selectFile(p)})}catch(e){$('#fileerror').textContent=e.message}}
 async function renderUpdates(){
-  /* Updates tab: only ever fast-forwards to GitHub's main branch, refuses
-     anything destructive (dirty tree, diverged history), and relaunches the
-     server itself after pulling. */
-  $('#content').innerHTML=`<div class="intro"><div><h1>Updates</h1><p>Keep this dashboard current from GitHub. Updating never overwrites local edits: it refuses when the source has changes that are not on GitHub, and it only fast-forwards.</p></div></div><div class="table" style="padding:24px;max-width:850px"><div class="eyebrow">DASHBOARD / SELF-UPDATE</div><div id="updstate" class="notice">Checking GitHub…</div><div style="margin-top:14px"><button class="primary" id="updapply" disabled>Update now ↻</button> <button class="ghost" id="updrefresh">Re-check</button></div><div id="upderror" class="error"></div></div>`;
-  const show=async()=>{
+  /* Updates tab, release-panel style: current version beside the newest on
+     GitHub, the changelog in between, and one clearly-scoped action. Updating
+     never overwrites local edits: it refuses while the source tree is dirty
+     and only ever fast-forwards -- it cannot destroy anything. */
+  $('#content').innerHTML=`<div class="intro"><div><h1>Updates</h1><p>This dashboard updates itself from GitHub — fast-forward only, and never over local edits.</p></div></div><div class="table" style="padding:26px 28px;max-width:880px"><div class="eyebrow">DASHBOARD / RELEASES</div>
+  <div id="updpanel" style="margin-top:10px">
+    <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:14px;align-items:center">
+      <div style="border:1px solid #1d2321;border-radius:12px;padding:16px 18px">
+        <div class="hint" style="margin-bottom:6px">RUNNING NOW</div>
+        <div style="font-size:26px;font-weight:700" class="mono" id="updcur">—</div>
+        <div class="hint" id="updcurmsg" style="margin-top:6px">checking…</div>
+      </div>
+      <div style="text-align:center;color:#48e08a;font-size:22px" id="updarrow">•</div>
+      <div style="border:1px solid #1d2321;border-radius:12px;padding:16px 18px;background:#0d1110">
+        <div class="hint" style="margin-bottom:6px">ON GITHUB (origin/main)</div>
+        <div style="font-size:26px;font-weight:700" class="mono" id="updrem">—</div>
+        <div class="hint" id="updremmsg" style="margin-top:6px">checking…</div>
+      </div>
+    </div>
+    <div id="updchangelog" style="margin-top:14px"></div>
+    <div style="display:flex;gap:10px;margin-top:18px;align-items:center">
+      <button class="primary" id="updapply" disabled>Update now ↻</button>
+      <button class="ghost" id="updrefresh">Re-check</button>
+      <span class="hint" id="updnote"></span>
+    </div>
+    <div id="upderror" class="error" style="margin-top:10px"></div>
+  </div></div>`;
+  const paint=async()=>{
+    const panel=$('#updpanel');
     try{
       let x=await api('/api/updates');
       if(x.error&&!x.current)throw Error(x.error);
       let cur=x.current||{};
-      let msg;
-      if(x.available)msg=`<b>Update available</b> — running <span class="mono">${esc(cur.short)}</span> (“${esc(cur.subject)}”), GitHub offers <span class="mono">${esc(x.remote_short||'?')}</span>. Applying fast-forwards and restarts this dashboard.`;
-      else msg=`<b>Up to date ✓</b> — running <span class="mono">${esc(cur.short)}</span> (“${esc(cur.subject)}”). This is the newest commit on GitHub.`;
-      if(x.dirty)msg+=` <b>Local edits exist</b> in the source directory; update will refuse until that is committed or handed to GitHub.`;
-      $('#updstate').innerHTML=msg;
+      $('#updcur').textContent=cur.short||'?';
+      $('#updcurmsg').textContent=cur.subject||'';
+      $('#updrem').textContent=x.remote_short||(x.available?'':'(unreachable)');
+      if(x.dirty){$('#updnote').innerHTML='<b>Local edits exist</b> in the source directory — commit or hand them to GitHub first; the update refuses to overwrite anything.'}
+      else if(x.behind){$('#updnote').textContent=x.behind+' commit'+(x.behind===1?'':'s')+' behind GitHub'}
+      else $('#updnote').textContent=x.error?('GitHub check failed: '+x.error):(x.available?'':'You are on the newest commit.');
+      $('#updarrow').textContent=x.behind?'↓':'✓';
+      $('#updremmsg').textContent=x.available?'newer version available':(x.remote_short?'same as running':'');
+      let log='';
+      if(Array.isArray(x.log)&&x.log.length){
+        log='<div class="hint" style="margin:2px 0 8px">WHAT UPDATES</div><div style="display:flex;flex-direction:column;gap:6px">'+x.log.map(l=>`<div style="display:flex;gap:10px;align-items:baseline"><span class="mono" style="color:#8a8f8b;min-width:70px">${esc(l.short)}</span><span>${esc(l.subject)}</span></div>`).join('')+'</div>';
+      }
+      $('#updchangelog').innerHTML=log;
       $('#updapply').disabled=!x.available||x.dirty;
-    }catch(e){$('#updstate').textContent='Cannot check GitHub: '+e.message}
+    }catch(e){
+      $('#updcurmsg').textContent='Cannot check GitHub: '+e.message;
+      $('#updnote').textContent='';
+    }
   };
+  const show=async()=>{await paint()};
   $('#updrefresh').onclick=show;
   $('#updapply').onclick=async()=>{if(!confirm('Update the dashboard from GitHub and restart it? The page will reconnect automatically.'))return;
-    $('#updapply').disabled=true;$('#upderror').textContent='';
+    $('#updapply').disabled=true;$('#upderror').textContent='';$('#updnote').textContent='Updating and restarting…';
     try{let x=await api('/api/updates/apply',{method:'POST'});
-      if(x.updated){toast('Updated — dashboard is restarting…');let n=0;const t=setInterval(async()=>{n++;try{await fetch('/api/auth/session');clearInterval(t);location.reload()}catch(e){if(n>30){clearInterval(t);location.reload()}}},1500)}
-      else{toast('Already up to date');await show()}}
-    catch(e){$('#upderror').textContent=e.message;await show()}
+      if(x.updated){toast('Updated — dashboard is restarting…');$('#updnote').textContent='Restarting on the new version…';let n=0;const t=setInterval(async()=>{n++;try{await fetch('/api/auth/session');clearInterval(t);location.reload()}catch(e){if(n>30){clearInterval(t);location.reload()}}},1500)}
+      else{toast('Already up to date');await paint()}}
+    catch(e){$('#upderror').textContent=e.message;await paint()}
     finally{$('#updapply').disabled=false}};
   await show();
 }
@@ -162,60 +198,141 @@ let cfZones=[];let routeSlug=makeSlug();
 function makeSlug(){let words=[['quiet','silver','happy','cosmic','gentle','bright','clever'],['space','forest','river','cloud','orbit','ocean'],['train','fox','comet','bird','station','whale']];let a=new Uint32Array(3),b=new Uint8Array(7);crypto.getRandomValues(a);crypto.getRandomValues(b);return words.map((w,i)=>w[a[i]%w.length]).join('-')+'-'+Array.from(b,x=>x.toString(16).padStart(2,'0')).join('')}
 function tokenTemplate(){let u=new URL('https://dash.cloudflare.com/profile/api-tokens');u.searchParams.set('permissionGroupKeys',JSON.stringify([{key:'zone',type:'read'},{key:'dns',type:'edit'},{key:'argotunnel',type:'edit'}]));u.searchParams.set('accountId','*');u.searchParams.set('zoneId','all');u.searchParams.set('name','Robo Universal Tunnel');return u.href}
 async function renderDomains(){
-  $('#content').innerHTML=`<div class="intro"><div><h1>Domains & ports</h1><p>Connect Cloudflare directly to publish services from your machines.</p></div></div><div class="table" style="padding:24px;max-width:850px"><div class="eyebrow">CLOUDFLARE / DIRECT CONNECTION</div><h2>Connect your domain</h2><p class="notice">Create a token with Zone Read, DNS Edit and Cloudflare Tunnel Edit. Limit it to your account and zones. Paste it below; Robo stores it on the host to manage tunnels. Use HTTPS to access this dashboard.</p><a class="primary small" target="_blank" rel="noopener" href="${esc(tokenTemplate())}">Create Cloudflare token ↗</a><p class="notice">Review the permissions and resources on Cloudflare, create the token, and copy it here.</p><div class="fileauth"><input id="cftoken" type="password" placeholder="Cloudflare API token" autocomplete="off"><button class="primary small" id="cfconnect">Find domains</button></div><div id="cferror" class="error" role="alert"></div><div id="cfzones" class="fileauth"></div><div id="cfstatus" class="notice">Checking connection…</div><p class="notice">Publishing requires cloudflared installed on this Linux host. Each published port is public; private access is not available in this version. DNS and certificates can take time to become ready.</p></div>`;
-  const show=async()=>{try{let x=await api('/api/cloudflare/setup');let zn=(x.connected&&Array.isArray(x.zones))?x.zones.length:0;$('#cfstatus').textContent=(x.connected?('Connected. '+zn+' domain'+(zn===1?'':'s')+' available: '+x.zones.map(z=>z.name).join(', '))
-:'Not connected. ')+(x.cloudflared?'cloudflared is installed.':'cloudflared is missing on this host.')+(x.pending_cleanup?' Some routes need cleanup.':'');if(x.connected){let b=document.createElement('button');b.className='ghost';b.textContent='Disconnect';b.onclick=async()=>{if(!confirm('Disconnect Cloudflare? Published ports must be removed first.'))return;try{await api('/api/cloudflare/setup',{method:'DELETE'});await show()}catch(e){$('#cferror').textContent=e.message}};$('#cfstatus').append(' ',b)}}catch(e){$('#cfstatus').textContent=e.message}};
-  $('#cfconnect').onclick=async()=>{let input=$('#cftoken');$('#cferror').textContent='';try{let r=await api('/api/cloudflare/zones',{method:'POST',body:JSON.stringify({token:input.value.trim().replace(/\s+/g,'')})});cfZones=r.zones;if(!cfZones.length)throw Error('No active zones found. The token connected but lists no zones you can use.');$('#cfzones').innerHTML=`<select id="cfzone" aria-label="Choose default domain">${cfZones.map(z=>`<option value="${esc(z.id)}">${esc(z.name)}</option>`).join('')}</select><button class="primary small" id="cfsave">Connect domains</button><span class="hint">All ${cfZones.length} of your Cloudflare domains become available for publishing; the one you pick is the default.</span>`;$('#cfsave').onclick=async()=>{try{await api('/api/cloudflare/setup/connect',{method:'POST',body:JSON.stringify({token:input.value.trim(),zone_id:$('#cfzone').value})});input.value='';$('#cfzones').innerHTML='';await show();toast('Cloudflare connected')}catch(e){$('#cferror').textContent=e.message}}}catch(e){$('#cferror').textContent=e.message}};
+  $('#content').innerHTML=`<div class="intro"><div><h1>Domains & ports</h1><p>Connect Cloudflare directly to publish services from your machines.</p></div></div>
+<div class="table" style="padding:24px;max-width:850px"><div class="eyebrow">CLOUDFLARE / DIRECT CONNECTION</div><h2>Connect your domain</h2><p class="notice">Create a token with Zone Read, DNS Edit and Cloudflare Tunnel Edit. Limit it to your account and zones. Paste it below; Robo stores it on the host to manage tunnels. Use HTTPS to access this dashboard.</p><a class="primary small" target="_blank" rel="noopener" href="${esc(tokenTemplate())}">Create Cloudflare token ↗</a><p class="notice">Review the permissions and resources on Cloudflare, create the token, and copy it here.</p><div class="fileauth"><input id="cftoken" type="password" placeholder="Cloudflare API token" autocomplete="off"><button class="primary small" id="cfconnect">Find domains</button></div><div id="cferror" class="error" role="alert"></div><div id="cfzones" class="fileauth"></div><div id="cfstatus" class="notice">Checking connection…</div><p class="notice">Publishing requires cloudflared installed on this Linux host. Each published port is public; private access is not available in this version.</p></div>
+<div class="table" style="padding:24px;max-width:850px"><div class="eyebrow">DOMAINS / WILDCARD GATEWAYS</div><h2>Gateways per domain</h2><p class="notice">A gateway is a root subdomain (e.g. <span class="mono">burrows</span>) backed by ONE wildcard DNS record. Every published port of any machine becomes a label under it — <span class="mono">web-8080.burrows.robo-universe.top</span> — with instant DNS and no per-port records. The root domain itself is never addressed directly.</p><div id="cfconnector" class="notice">Loading…</div></div>`;
+  const showGates=async()=>{
+    const box=$('#cfconnector');if(!box)return;
+    try{
+      let gs=await api('/api/cloudflare/gates');
+      if(!gs.connected){box.textContent='Connect Cloudflare above to configure gateways.';return}
+      let zonesList=gs.zones||[];
+      if(!zonesList.length){box.textContent='No usable domain on this connection.';return}
+      const defZone=zonesList.find(z=>z.default)||zonesList[0];
+      box.innerHTML=`<div style="display:flex;flex-direction:column;gap:14px;margin-top:10px">`+zonesList.map(z=>`
+        <div class="zonebox">
+          <div class="zonehead">
+            <b>${esc(z.name)}</b>
+            <label class="gatepick" title="Make this the domain new machines publish on by default"><input type="radio" name="defzone" value="${esc(z.id)}" ${z.id===defZone.id?'checked':''}><span>default domain</span></label>
+            <span class="hint">${(z.gates||[]).length} gateway${(z.gates||[]).length===1?'':'s'}</span>
+          </div>
+          <div data-gatelist="${esc(z.id)}">
+            ${(z.gates||[]).map(g=>`
+              <div class="gaterow"><div class="gateinfo"><span class="gname">${g.name==='_'?esc(z.name):esc(g.name)+'.'+esc(z.name)}</span>
+              <span class="ghint">${g.name==='_'?'every label directly under the domain — one wildcard record, free TLS':'labels like web-8080.'+esc(g.name)+'.'+esc(z.name)+' here — the TLS for these two levels comes from a linked VPS relay, not Cloudflare'}</span>
+              <span class="pub-access">${(g.status==='connected')?'connected ✓':(g.status==='down'?'connector down — will retry':'not set up yet')}</span></div>
+              <span class="gateacts"><label class="gatepick" title="Publish here by default when this machine has no explicit choice"><input type="radio" name="defgate-${esc(z.id)}" value="${esc(g.name)}" ${z.default_gate===g.name||(!z.default_gate&&g.name==='_')?'checked':''}><span>default gateway</span>${z.default_gate===g.name||(!z.default_gate&&g.name==='_')?'<span class="default-tag">DEFAULT</span>':''}</label>
+              <button class="ghost sm" data-ensure="${esc(z.id)}" data-gate="${esc(g.name)}">Repair</button>
+              <button class="ghost sm danger" data-removegate="${esc(g.id||'')}" data-gate="${esc(g.name)}" style="${g.id?'':'visibility:hidden'}">Remove</button></span></div>`).join('')||'<div class="gaterow"><span class="ghint">No gateways on this domain yet. Add one below — the catch-all (${esc(z.name)}) is the usual pick.</span></div>'}
+          </div>
+          <div class="fileauth newgate"><input placeholder="new gateway, e.g. burrows" data-newgate="${esc(z.id)}" maxlength="63" autocapitalize="off" spellcheck="false"><button class="ghost sm" data-addgate="${esc(z.id)}">Add gateway</button></div>
+          <div class="ghint" style="color:var(--muted)">Need a gate subdomain? Link a VPS relay first — on this host run <span class="mono">python3 tools/robo-vps-link link user@your-vps-ip --zone ${esc(z.name)} --gate burrows</span>. The catch-all above works without one.</div>
+        </div>`).join('')+`</div>
+        <div style="margin-top:16px;display:flex;align-items:center;gap:12px"><button class="primary small" id="cfconfigsave">Save defaults</button> <span class="hint" id="cfgatesmsg"></span></div>`;
+      box.querySelectorAll('[data-addgate]').forEach(b=>b.onclick=async()=>{
+        const zid=b.dataset.addgate,input=box.querySelector('[data-newgate="'+zid+'"]'),name=((input&&input.value)||'').trim().toLowerCase();
+        $('#cfgatesmsg').textContent='';if(!name)return;
+        $('#cfgatesmsg').textContent='Setting up wildcard record + tunnel…';
+        try{let x=await api('/api/cloudflare/gates',{method:'POST',body:JSON.stringify({zone_id:zid,gate:name})});
+          $('#cfgatesmsg').textContent='';toast('Gateway ready: '+x.wildcard);await showGates()}
+        catch(e){$('#cfgatesmsg').textContent=e.message;await showGates()}});
+      box.querySelectorAll('[data-ensure]').forEach(b=>b.onclick=async()=>{
+        $('#cfgatesmsg').textContent='Checking tunnel + wildcard…';
+        try{await api('/api/cloudflare/gates',{method:'POST',body:JSON.stringify({zone_id:b.dataset.ensure,gate:b.dataset.gate})});
+          $('#cfgatesmsg').textContent='';toast('Gateway connected');await showGates()}
+        catch(e){$('#cfgatesmsg').textContent=e.message;await showGates()}});
+      box.querySelectorAll('[data-removegate]').forEach(b=>b.onclick=async()=>{
+        if(!b.dataset.removegate)return;
+        if(!confirm('Remove gateway "'+b.dataset.gate+'"? Its wildcard DNS record and tunnel are torn down; everything published through it stops resolving.'))return;
+        $('#cfgatesmsg').textContent='Tearing down…';
+        try{await api('/api/cloudflare/gates/'+encodeURIComponent(b.dataset.removegate),{method:'DELETE'});
+          $('#cfgatesmsg').textContent='';toast('Gateway removed');await showGates()}
+        catch(e){$('#cfgatesmsg').textContent=e.message;await showGates()}});
+      const gname=(zid)=>{const r=document.querySelector('input[name="defgate-'+zid+'"]:checked');return r?r.value:''};
+      $('#cfconfigsave').onclick=async()=>{
+        try{
+          let gs2=await api('/api/cloudflare/gates');let zl=(gs2&&gs2.zones)||[];
+          let payload={default_zone_id:(box.querySelector('input[name="defzone"]:checked')||{}).value||'',gates:{},defaults:{}};
+          zl.forEach(z=>{payload.gates[z.id]=(z.gates||[]).map(g=>g.name);payload.defaults[z.id]=gname(z.id)});
+          await api('/api/cloudflare/zones-config',{method:'POST',body:JSON.stringify(payload)});
+          $('#cfgatesmsg').textContent='Saved.';toast('Defaults saved');await showGates()}
+        catch(e){$('#cfgatesmsg').textContent=e.message}};
+    }catch(e){box.textContent=e.message}
+  };
+  const show=async()=>{
+    try{
+      let x=await api('/api/cloudflare/setup');
+      let zn=(x.connected&&Array.isArray(x.zones))?x.zones.length:0;
+      $('#cfstatus').textContent=(x.connected?('Connected. '+zn+' domain'+(zn===1?'':'s')+' available: '+x.zones.map(z=>z.name).join(', ')):'Not connected. ')+(x.cloudflared?'cloudflared is installed.':'cloudflared is missing on this host.')+(x.pending_cleanup?' Some routes need cleanup.':'');
+      if(x.connected){let b=document.createElement('button');b.className='ghost';b.textContent='Disconnect';b.onclick=async()=>{if(!confirm('Disconnect Cloudflare? Published ports must be removed first.'))return;try{await api('/api/cloudflare/setup',{method:'DELETE'});await show()}catch(e){$('#cferror').textContent=e.message}};$('#cfstatus').append(' ',b)}
+    }catch(e){$('#cfstatus').textContent=e.message}
+    await showGates();
+  };
+  $('#cfconnect').onclick=async()=>{let input=$('#cftoken');$('#cferror').textContent='';try{let r=await api('/api/cloudflare/zones',{method:'POST',body:JSON.stringify({token:input.value.trim()})});cfZones=r.zones;if(!cfZones.length)throw Error('No active zones found. The token connected but lists no zones you can use.');$('#cfzones').innerHTML=`<select id="cfzone" aria-label="Choose default domain">${cfZones.map(z=>`<option value="${esc(z.id)}">${esc(z.name)}</option>`).join('')}</select><button class="primary small" id="cfsave">Connect domains</button><span class="hint">All ${cfZones.length} of your Cloudflare domains become available for publishing; the one you pick is the default.</span>`;$('#cfsave').onclick=async()=>{try{await api('/api/cloudflare/setup/connect',{method:'POST',body:JSON.stringify({token:input.value.trim(),zone_id:$('#cfzone').value})});input.value='';$('#cfzones').innerHTML='';await show();toast('Cloudflare connected')}catch(e){$('#cferror').textContent=e.message}}}catch(e){$('#cferror').textContent=e.message}};
   await show();
 }
 
-let portVM='',portsWired=false,portsZones=[];
-function makePortName(port){let v=vms.find(v=>v.id===portVM),base=((v&&v.name)||'vm').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40-1-String(port).length).replace(/-+$/,'')||'vm';return base+'-'+port}
+let portVM='',portsWired=false,portsZones=[],portPick=[];
+function makePortName(port){let v=vms.find(v=>v.id===portVM),base=((v&&v.name)||'vm').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,63-1-String(port).length).replace(/-+$/,'')||'vm';return base+'-'+port}
 function portSuggestions(port){return [makePortName(port),'port-'+port,'app-'+port]}
-/* The address block: domain select (every connected Cloudflare domain),
-   subdomain suggestions locked until a domain is picked, and a free-text
-   custom field that always wins over the picker. */
+/* The address block: every domain+gateway pair (a domain can host several
+   gateways) appears in the dropdown; the default one is preselected. The
+   publish name rides as a label UNDER the gateway, github-codespace style,
+   so one wildcard DNS record serves all ports and the root domain is never
+   addressed directly. */
+function portURL(p,sub){return p.gate==='_' ? (sub+'.'+p.zone) : (sub+'.'+p.gate+'.'+p.zone)}
+/* The address block: the zone catch-all (gate '_', built on demand right
+   before the first publish of a domain) and, when a VPS relay is linked for
+   it, any gate subdomain. The publish name rides UNDER the gateway,
+   github-codespace style, so one wildcard record serves every port and the
+   bare root is never addressed. */
 async function populatePortDomains(){
   const sel=$('#portdomain'),pick=$('#subpick');
-  try{let x=await api('/api/cloudflare/setup');portsZones=(x.connected&&Array.isArray(x.zones)&&x.zones.length)?x.zones:[]}catch(e){portsZones=[]}
-  if(portsZones.length){
-    sel.innerHTML=portsZones.map(z=>`<option value="${esc(z.id)}">${esc(z.name)}${z.wildcard?' 🌐 catch-all':''}</option>`).join('');
-    sel.disabled=false;
-    $('#domainhint').textContent=portsZones.length>1?`${portsZones.length} connected domains — pick one, then a subdomain below.`:'Pick a subdomain suggestion or type your own.';
+  try{let gs=await api('/api/cloudflare/gates');portPick=[]
+    for(const z of (gs&&Array.isArray(gs.zones)?gs.zones:[]))
+      for(const g of (z.gates||[]).filter(g=>g.name==='_'||g.status!=='unbuilt'))
+        portPick.push({zone_id:z.id,zone:z.name,gate:g.name,default:!!z.default&&g.default,auto:g.name==='_'&&g.status==='unbuilt'});
+  }catch(e){portPick=[]}
+  if(portPick.length){
+    let def=portPick.findIndex(p=>p.default&&!p.auto);
+    if(def<0)def=portPick.findIndex(p=>p.default);
+    if(def<0)def=0;
+    sel.innerHTML=portPick.map((p,i)=>`<option value="${i}">${esc(p.zone)}${p.gate==='_'?' — labels under the domain':' — via '+esc(p.gate)}${p.auto?' (built on first publish)':p.default?' (default)':''}</option>`).join('');
+    sel.selectedIndex=def;sel.disabled=false;
+    $('#domainhint').textContent=`One wildcard record per domain; the port becomes a label: ${esc(portSuggestions(3000)[0])}.${esc(portURL(portPick[def],'').slice(0))}. Gate subdomains appear here too once a VPS relay is linked (Domains page).`;
   }else{
-    sel.innerHTML='<option value="">No connected domain</option>';sel.disabled=true;
-    pick.disabled=true;pick.innerHTML='<option value="">Connect Cloudflare first</option>';
-    $('#domainhint').textContent='No Cloudflare connection. Open “Domains & ports” in the sidebar to connect one.';
+    sel.innerHTML='<option value="">No domain connected</option>';sel.disabled=true;
+    pick.disabled=true;pick.innerHTML='<option value="">—</option>';
+    $('#domainhint').textContent='Connect your domains on the “Domains & ports” page first — then every published port gets an instant address under one of them.';
   }
   portSubSuggestions();
 }
 function portSubSuggestions(){
   const pick=$('#subpick'),port=$('#guestport').value;
   pick.innerHTML='<option value="">Custom — type your own</option>'+portSuggestions(port).map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');
-  pick.disabled=!$('#portdomain').value||!portsZones.length;
+  pick.disabled=!portPick.length;
   pick.value=portSuggestions(port)[0];
   $('#portlabel').value=pick.value||'';
   syncPortPreview();
 }
 function syncPortPreview(){
-  const z=portsZones.find(z=>z.id===$('#portdomain').value);
+  const p=portPick[Number($('#portdomain').value||0)];
   const sub=($('#portlabel').value.trim()||'port-'+$('#guestport').value).toLowerCase().replace(/\s+/g,'-');
-  const ok=!!z&&/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(sub);
+  const ok=!!p&&/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(sub);
   $('#urlpreview').hidden=!ok;
-  if(ok)$('#prevurl').textContent='https://'+sub+'.'+z.name;
+  if(ok)$('#prevurl').textContent='https://'+portURL(p,sub)
 }
 function openPorts(id){portVM=id;$('#guestport').value=3000;
   if(!portsWired){portsWired=true;document.querySelectorAll('#accesschips [data-access]').forEach(b=>b.onclick=()=>{$('#portaccess').value=b.dataset.access;document.querySelectorAll('#accesschips [data-access]').forEach(x=>x.classList.toggle('is-on',x===b))});
-    $('#portdomain').addEventListener('change',()=>{let z=portsZones.find(z=>z.id===$('#portdomain').value);
-      $('#domainhint').textContent=!$('#portdomain').value?'Choose a domain.':z&&z.wildcard?'⚠ This domain has a catch-all (*) record — every unknown name resolves to the service that owns it (e.g. the Aegis relay). Requests may answer with that service’s 404 (“No tunnel is called…”). Wait for DNS caches to clear, then reload.':'Pick a subdomain suggestion or type your own.';portSubSuggestions()});
+    $('#portdomain').addEventListener('change',()=>{syncPortPreview()});
     $('#subpick').addEventListener('change',()=>{if($('#subpick').value){$('#portlabel').value=$('#subpick').value}syncPortPreview()});
     $('#portlabel').addEventListener('input',()=>{$('#subpick').value=$('#portlabel').value?'':portSuggestions($('#guestport').value)[0];syncPortPreview()});
     $('#guestport').addEventListener('change',()=>{portSubSuggestions()});
   }
   $('#portaccess').value='public';document.querySelectorAll('#accesschips [data-access]').forEach(x=>x.classList.toggle('is-on',x.dataset.access==='public'));
   $('#urlpreview').hidden=true;$('#porterror').textContent='';$('#portsmodal').classList.remove('hidden');loadPorts();populatePortDomains()}
-async function loadPorts(){try{let rows=await api('/api/publishing');let own=rows.filter(r=>r.vm===portVM);$('#publishedlist').innerHTML=own.length?own.map(r=>{let st=r.tunnel?.status||r.phase,dns=st==='provisioning'?`<span class="pub-access" title="The DNS record was created; resolvers may need a moment. Retry the link shortly or clear the browser cache.">DNS propagating…</span>`:'<span class="pub-access">'+esc(r.access==='login'?'Aegis sign-in':'Public')+'</span>';return `<div class="pub-row"><div class="pub-info"><strong>Port ${esc(r.guest_port)}</strong>${r.tunnel?.domain?`<span class="pub-access">${esc(r.tunnel.domain)}${r.tunnel.wildcard?' ✓catch-all':''}</span>`:''}${dns}${r.tunnel?.url?`<a href="${esc(r.tunnel.url)}" target="_blank" rel="noopener">${esc(r.tunnel.url)} ↗</a>`:'<span class="pub-wait">Address provisioning or unavailable</span>'}</div><button class="ghost sm danger" data-unpublish="${esc(r.guest_port)}">Unpublish</button></div>`}).join(''):'<span class="pub-wait">No ports published yet.</span>';document.querySelectorAll('[data-unpublish]').forEach(b=>b.onclick=async()=>{if(!confirm('Unpublish this address?'))return;try{await api('/api/vms/'+encodeURIComponent(portVM)+'/ports/'+b.dataset.unpublish,{method:'DELETE'});await loadPorts()}catch(e){$('#porterror').textContent=e.message}})}catch(e){$('#publishedlist').textContent='Publishing unavailable: '+e.message}}
-$('#portform').onsubmit=async e=>{e.preventDefault();let access=$('#portaccess').value,zone_id=$('#portdomain').value||null;if(access==='public'&&!confirm('This will expose the guest service publicly to the internet. Continue?'))return;$('#porterror').textContent='';$('#portpublish').disabled=true;try{let x=await api('/api/vms/'+encodeURIComponent(portVM)+'/ports',{method:'POST',body:JSON.stringify({port:Number($('#guestport').value),sub:$('#portlabel').value.trim(),access,zone_id})});toast(x.tunnel&&x.tunnel.wildcard&&x.tunnel.status!=='ready'?'Route created. This domain has a catch-all: its 404 may come from the Aegis relay for a few minutes while DNS clears.':'Route created; DNS is propagating (a fresh NXDOMAIN clears within a minute or two)');await loadPorts()}catch(e){$('#porterror').textContent=e.message}finally{$('#portpublish').disabled=false}};$('#closeports').onclick=()=>$('#portsmodal').classList.add('hidden');
+async function loadPorts(){try{let rows=await api('/api/publishing');let own=rows.filter(r=>r.vm===portVM);$('#publishedlist').innerHTML=own.length?own.map(r=>{let st=r.tunnel?.status||r.phase,dns=st==='provisioning'?`<span class="pub-access" title="The DNS record was created; resolvers may need a moment. Retry the link shortly or clear the browser cache.">DNS propagating…</span>`:'<span class="pub-access">'+esc(r.access==='login'?'Aegis sign-in':'Public')+'</span>';return `<div class="pub-row"><div class="pub-info"><strong>Port ${esc(r.guest_port)}</strong>${r.tunnel?.domain?`<span class="pub-access">${esc(r.tunnel.domain)}${r.tunnel.wildcard?' via gateway':''}</span>`:''}${dns}${r.tunnel?.url?`<a href="${esc(r.tunnel.url)}" target="_blank" rel="noopener">${esc(r.tunnel.url)} ↗</a>`:'<span class="pub-wait">Address provisioning or unavailable</span>'}</div><button class="ghost sm danger" data-unpublish="${esc(r.guest_port)}">Unpublish</button></div>`}).join(''):'<span class="pub-wait">Nothing published from this machine yet.</span>';document.querySelectorAll('[data-unpublish]').forEach(b=>b.onclick=async()=>{if(!confirm('Unpublish port '+b.dataset.unpublish+'? Its public address stops working.'))return;try{await api('/api/vms/'+encodeURIComponent(portVM)+'/ports/'+encodeURIComponent(b.dataset.unpublish),{method:'DELETE'});await loadPorts();toast('Port unpublished')}catch(e){toast(e.message)}})}catch(e){$('#publishedlist').innerHTML='<span class="error">'+esc(e.message)+'</span>'}}
+$('#portform').onsubmit=async e=>{e.preventDefault();let access=$('#portaccess').value,p=portPick[Number($('#portdomain').value||0)];if(!p)return toast('No domain selected');if(access==='public'&&!confirm('This will expose the guest service publicly to the internet. Continue?'))return;$('#porterror').textContent='';$('#portpublish').disabled=true;try{if(p.auto){await api('/api/cloudflare/gates',{method:'POST',body:JSON.stringify({zone_id:p.zone_id,gate:'_'})});p.auto=false}let x=await api('/api/vms/'+encodeURIComponent(portVM)+'/ports',{method:'POST',body:JSON.stringify({port:Number($('#guestport').value),sub:$('#portlabel').value.trim().toLowerCase(),access,zone_id:p.zone_id,gate:p.gate})});$('#portsmodal').classList.add('hidden');toast('Published at '+x.tunnel.url);await loadPorts()}catch(err){$('#porterror').textContent=err.message}finally{$('#portpublish').disabled=false}};
 
 // Keep the dashboard live: poll every 2s while a machine is starting, every 4s
 // otherwise, always on the VMs tab. The busy-guard stops overlapping fetches.
