@@ -209,7 +209,7 @@ async function renderDomains(){
       let zonesList=gs.zones||[];
       if(!zonesList.length){box.textContent='No usable domain on this connection.';return}
       const defZone=zonesList.find(z=>z.default)||zonesList[0];
-      box.innerHTML=`<div style="display:flex;flex-direction:column;gap:14px;margin-top:10px">`+zonesList.map(z=>`
+      box.innerHTML=`<div style="display:flex;flex-direction:column;gap:25px;margin-top:16px">`+zonesList.map(z=>`
         <div class="zonebox">
           <div class="zonehead">
             <b>${esc(z.name)}</b>

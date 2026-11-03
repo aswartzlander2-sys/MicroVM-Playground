@@ -174,7 +174,12 @@ footer {
 .spark { color: var(--chart); font-size: 14px; margin-left: 8px; }
 
 /* ---------------------------------------------------------------- content */
-#content { padding: 20px 28px 60px; max-width: 1024px; width: 100%; margin: 0 auto; flex: 1; }
+#content { padding: 20px 28px 60px; max-width: 1024px; width: 100%; margin: 0 auto; flex: 1;
+  display: flex; flex-direction: column; gap: 25px; }
+/* every direct child keeps its natural width; extra wide children shrink not overflow */
+#content > * { min-width: 0; max-width: 100%; }
+/* the section header no longer adds its own margins on top of the 25px gap */
+#content > .intro { margin: 0; }
 .intro { display: flex; justify-content: space-between; gap: 16px; align-items: end; margin: 10px 0 24px; }
 .intro .eyebrow { color: var(--muted); }
 h1 { font: 600 30px/1.15 var(--display); letter-spacing: -0.028em; margin: 10px 0 6px; }
